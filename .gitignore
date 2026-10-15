@@ -1,0 +1,12 @@
+# live restaurant data never goes into git
+data/*.db
+data/*.db-*
+data/backups/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.env
+*.log
+.DS_Store
