@@ -9,6 +9,7 @@ import os
 import sys
 
 from .db import DB_PATH, init_db, tx
+from .security import hash_pin
 
 STAFF = [("Admin", "1234", "admin"), ("Manager Demo", "2222", "manager"), ("Cashier Demo", "1111", "cashier")]
 
@@ -45,7 +46,13 @@ MENU = [
 ]
 
 
-def seed(reset=False):
+def seed(reset=False, force=False):
+    if os.path.exists(DB_PATH) and not force:
+        init_db()
+        with tx() as c:
+            if c.execute("SELECT 1 FROM days LIMIT 1").fetchone():
+                raise SystemExit("This database already has business days. Refusing to add demo data to (or wipe) real "
+                                 "records. Use a separate CFC_DB file for demos.")
     if reset and os.path.exists(DB_PATH):
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(DB_PATH + suffix):
@@ -53,7 +60,9 @@ def seed(reset=False):
     init_db()
     with tx() as c:
         for name, pin, role in STAFF:
-            c.execute("INSERT OR IGNORE INTO staff(name, pin, role) VALUES (?, ?, ?)", (name, pin, role))
+            # Demo PINs are deliberately simple and NOT forced to change: never seed a live database.
+            c.execute("INSERT OR IGNORE INTO staff(name, pin_hash, role, must_change_pin) VALUES (?, ?, ?, 0)",
+                      (name, hash_pin(pin), role))
         for row in INGREDIENTS:
             c.execute(
                 "INSERT OR IGNORE INTO ingredients(name, unit, cost_per_unit, par_level, count_daily) VALUES (?,?,?,?,?)",
@@ -69,7 +78,10 @@ def seed(reset=False):
                 iid = c.execute("SELECT id FROM ingredients WHERE name = ?", (ing,)).fetchone()["id"]
                 c.execute("INSERT OR IGNORE INTO recipe_lines(menu_item_id, ingredient_id, qty) VALUES (?, ?, ?)",
                           (mid, iid, qty))
-    print("Demo data loaded. PINs: admin 1234, manager 2222, cashier 1111")
+        c.execute("INSERT OR IGNORE INTO staff(name, pin_hash, role, must_change_pin) VALUES (?, ?, 'stock_controller', 0)",
+                  ("Stores Demo", hash_pin("3333")))
+        c.execute("INSERT OR IGNORE INTO suppliers(name, phone) VALUES ('Demo Supplier', '0700000000')")
+    print("Demo data loaded. PINs: admin 1234, manager 2222, cashier 1111, stock controller 3333")
 
 
 if __name__ == "__main__":

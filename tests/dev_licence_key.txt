@@ -1,0 +1,3 @@
+# TEST/DEVELOPMENT licence signing key - PUBLIC KNOWLEDGE, never use for real customers.
+# Licences signed with it are rejected when CFC_LICENCE_MODE=enforce.
+TT7MvCsyDLeifQBMf9xcqfaGQrIG2k5PHMU3Dp5uf6w=

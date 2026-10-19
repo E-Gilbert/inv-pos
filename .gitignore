@@ -10,3 +10,8 @@ venv/
 .env
 *.log
 .DS_Store
+# secrets & machine identity never go into git
+data/secret.key
+data/licence_public.key
+data/server.id
+data/*.log

@@ -1,0 +1,13 @@
+{
+  "name": "CFC INV-POS",
+  "short_name": "CFC POS",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#7a2e1d",
+  "theme_color": "#7a2e1d",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

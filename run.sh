@@ -3,4 +3,5 @@
 cd "$(dirname "$0")"
 [ -d .venv ] && source .venv/bin/activate
 echo "CFC POS running. On other devices open: http://$(hostname -I 2>/dev/null | awk '{print $1}'):8000"
-exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+export CFC_LICENCE_MODE="${CFC_LICENCE_MODE:-development}"
+exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --no-server-header
