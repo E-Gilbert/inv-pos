@@ -12,18 +12,19 @@ difference       = counted − expected        (negative = more left the store t
 
 This is the same formula as CFC's daily stock-movement workbook (`variance = system sales − actual sales`), so the workbook's history imports without sign changes and its last closing count becomes the system's opening stock.
 
-## Features (v0.2)
+## Features (v0.3)
 
 | Area | What it does |
 |---|---|
-| **POS** | Touch menu + barcode/SKU/name search (scanner = keyboard), cart, discounts (manager PIN above a set %), configurable tax (inclusive/exclusive), cash with change / M-Pesa code / card, 80 mm receipt, keyboard shortcuts for Windows tills |
+| **POS** | Order type per check (Dine in / Takeaway / Delivery, configurable), optional guest count, touch menu + barcode/SKU/name search (scanner = keyboard), cart, discounts (manager PIN above a set %), configurable tax (inclusive/exclusive), cash with change / M-Pesa code / card, 80 mm receipt, keyboard shortcuts for Windows tills |
 | **Safe checkout** | Every checkout has an idempotency key: a retry after a network drop returns the original sale instead of charging twice. Receipt numbers and stock deductions are written in one locked transaction |
 | **Cash shifts** | Open with a float, close with a count; expected cash = float + cash sales − cash refunds; over/short needs a note |
 | **Voids & refunds** | Same-day void (manager); partial/full refunds at any later date with manager approval, optional restock, exact-cent final refund |
 | **Stock** | Live on-hand per item, colour status (see below), waste, receiving, manager adjustments, full movement history with who/when/why |
 | **Purchasing** | Suppliers, purchase orders (draft → ordered → partial → received / closed short), partial deliveries, receiving updates stock only when goods arrive; optional last-cost or weighted-average costing |
 | **Open/close day** | Carry-over from last count, closing count with tolerance and mandatory reasons, blocked while cash shifts are open |
-| **Reports** | Day report; period report with gross sales, discounts, refunds, tax, net sales, **COGS** (cost snapshotted at sale time), **gross profit** and margin, purchases by supplier, waste, stock differences; stock valuation; CSV exports |
+| **Reports (MICROS-style)** | Sales detail, tax, hourly and serving-period sales, cashier over/short, guest check journal, employee sales by order type, major/family group, menu item sales with food cost, discount/void/refund reason reports; daily or any date range; print, CSV and an end-of-day pack. See [docs/MICROS_PARITY.md](docs/MICROS_PARITY.md) |
+| **Other reports** | Day report; period report with gross sales, discounts, refunds, tax, net sales, **COGS** (cost snapshotted at sale time), **gross profit** and margin, purchases by supplier, waste, stock differences; stock valuation; CSV exports |
 | **Import/export** | Recipe/ingredient template (.xlsx) and ingredient CSV with *Check file* preview, duplicate detection and all-or-nothing import; **daily stock-movement workbook importer** with unit confirmation and a discrepancy report |
 | **Security** | Hashed PINs + server pepper, login throttling, session expiry, forced PIN change for default/weak PINs, 4 roles enforced on the server, audit log, CSP and security headers, request size limits |
 | **Licensing** | Offline Ed25519-signed licences: activation, expiry + grace, renewal, revocation lists, device limits. **Development mode by default — never blocks** |
@@ -54,11 +55,12 @@ app/logic.py      business rules: selling, refunds, shifts, stock, purchasing, r
 app/db.py         schema + versioned migrations (auto-backup before upgrading)
 app/security.py   PIN hashing, sessions, login throttle, permission table
 app/importer.py   Excel/CSV import/export, workbook history import
+app/reports.py    MICROS-style management reports (one engine: screen, print, CSV, end-of-day pack)
 app/workbook.py   reader + discrepancy checks for the daily stock-movement workbook
 app/licence.py    licence verification (development mode by default)
 app/seed.py       demo data (refuses to touch a database with real days)
 static/           UI (index.html, app.js, style.css, manifest)
-scripts/          backup.py, reset_admin_pin.py, licence_tool.py
+scripts/          backup.py, eod_reports.py, reset_admin_pin.py, licence_tool.py
 tests/            pytest suite (business workflows, security, licensing, workbook)
 docs/             DEPLOYMENT.md, SECURITY.md, WORKBOOK_RECONCILIATION.md
 ```
@@ -97,7 +99,7 @@ pip-audit -r requirements.txt
 
 ## Backups
 
-Run `python scripts/backup.py` nightly (Task Scheduler). It makes a verified copy in `data/backups/` and keeps 30. Copy that folder off the machine regularly. Back up `data/secret.key` **separately** (`backup.py --key`). Restore steps are in `scripts/backup.py`.
+Run `python scripts/eod_reports.py` after closing to file the end-of-day report pack in `data/reports/`, and `python scripts/backup.py` nightly (Task Scheduler). It makes a verified copy in `data/backups/` and keeps 30. Copy that folder off the machine regularly. Back up `data/secret.key` **separately** (`backup.py --key`). Restore steps are in `scripts/backup.py`.
 
 ## Known limitations / roadmap
 

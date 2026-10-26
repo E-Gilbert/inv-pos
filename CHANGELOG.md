@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+Matches the core report set of CFC's current MICROS RES 3700 back office (see docs/MICROS_PARITY.md).
+- New reports engine (`app/reports.py`): sales detail with tender media, order types and daily lines; tax; time period (hourly); serving period; cashier shifts over/short; guest check journal; employee sales by order type; major group; category (family group); menu item sales with food cost and margin; discount, void and refund reason reports. Daily or any date range; on-screen, print, CSV.
+- Reports hub laid out like the MICROS menu, with quick date ranges and a one-click end-of-day pack; `scripts/eod_reports.py` for scheduled filing (the "autosequence").
+- Checkout records order type (configurable list) and an optional guest count; receipts show them.
+- Categories get a major group (Setup → Categories). Settings for order types, guest prompt and serving periods (validated: no overlaps).
+- Schema v3 migration (backed up automatically). 6 new tests with hand-checked figures (45 total).
+
 ## 0.2.0 — 2026-10-19
 
 **Data safety & security**

@@ -221,3 +221,14 @@ tr.st-row-grey td { color: var(--grey); }
   #toasts { bottom: 82px; }
 }
 @media (pointer: coarse) { .keys-hint { display: none; } }
+
+/* ---------- v0.3: order types, reports hub ---------- */
+.otypes { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.otypes button { flex: 1; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 8px 6px; font-weight: 700; min-height: 40px; }
+.otypes button.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+.rgroups { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 12px; }
+.rgroup { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px 10px; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.rgroup legend { font-weight: 800; font-size: 13px; padding: 0 4px; }
+.rgroup .btn { text-align: left; }
+tr.totrow td { border-top: 2px solid var(--ink); background: #faf7f3; }
+@media print { .printrep h2 { font-size: 15px; } .printrep .tablewrap { overflow: visible; } }

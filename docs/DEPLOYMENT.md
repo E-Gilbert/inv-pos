@@ -21,6 +21,7 @@ A desktop wrapper would only add value for direct USB receipt printing or a cash
 4. Give the server a **fixed IP** (router DHCP reservation), plug it into a **UPS**, disable sleep.
 5. Start automatically: Task Scheduler → *At log on* → run `run.bat`.
 6. Nightly backup: Task Scheduler → daily 23:30 → `.venv\Scripts\python.exe scripts\backup.py`.
+   End-of-day report pack (like a MICROS autosequence): daily 23:45 → `.venv\Scripts\python.exe scripts\eod_reports.py` (files the last closed day's reports in `data\reports\<date>\`).
 7. First login with PIN 1234 → you must choose a new admin PIN.
 
 **Updating:** stop `run.bat`, run `python scripts\backup.py`, replace the code (keep the `data\` folder!), run `setup.bat` (installs new dependencies), start `run.bat`.

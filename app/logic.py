@@ -263,14 +263,19 @@ def price_order(c, items, discount=None):
             "tax_rate": float(rate), "tax_inclusive": inclusive}
 
 
+def order_types(c):
+    return [t.strip() for t in (get_setting(c, "order_types") or "").split(",") if t.strip()] or ["Dine in"]
+
+
 def create_order(c, staff, items, payment_method, amount_tendered=None, payment_ref=None,
-                 discount=None, approver_pin=None, client_ref=None, terminal_id=None):
+                 discount=None, approver_pin=None, client_ref=None, terminal_id=None,
+                 order_type=None, guests=None):
     """Returns (order_id, duplicate). A repeated client_ref returns the original order and
     changes nothing, so a till that retries after a network drop can never double-charge or
     double-deduct stock."""
     payload = {"items": sorted((int(i["menu_item_id"]), int(i.get("qty", 0))) for i in items or []),
                "pm": payment_method, "tend": amount_tendered, "ref": (payment_ref or "").strip().upper(),
-               "disc": discount}
+               "disc": discount, "ot": order_type, "g": guests}
     rh = request_hash(payload)
     if client_ref:
         prev = c.execute("SELECT id, request_hash, staff_id FROM orders WHERE client_ref = ?", (client_ref,)).fetchone()
@@ -285,6 +290,15 @@ def create_order(c, staff, items, payment_method, amount_tendered=None, payment_
     shift = open_shift_for(c, staff["id"])
     if get_setting(c, "require_shift") == "1" and not shift:
         raise RuleError("Open your shift (enter the cash float) before selling.")
+
+    types = order_types(c)
+    order_type = (order_type or types[0]).strip()
+    if order_type not in types:
+        raise RuleError("Choose an order type: " + ", ".join(types) + ".")
+    if guests is not None:
+        guests = int(guests)
+        if not 0 <= guests <= 500:
+            raise RuleError("Guest count must be between 0 and 500.")
 
     p = price_order(c, items, discount)
     discount_by = None
@@ -326,12 +340,12 @@ def create_order(c, staff, items, payment_method, amount_tendered=None, payment_
     oid = c.execute(
         """INSERT INTO orders(day_id, number, staff_id, created_at, subtotal, discount, discount_reason, discount_by,
                               tax, tax_rate, tax_inclusive, total, payment_method, amount_tendered, payment_ref,
-                              payment_status, shift_id, client_ref, request_hash, terminal_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual_confirmed',?,?,?,?)""",
+                              payment_status, shift_id, client_ref, request_hash, terminal_id, order_type, guests)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual_confirmed',?,?,?,?,?,?)""",
         (day["id"], number, staff["id"], now(), float(p["subtotal"]), float(p["discount"]),
          ((discount or {}).get("reason") or "").strip() or None, discount_by, float(p["tax"]), p["tax_rate"],
          int(p["tax_inclusive"]), float(total), payment_method, tendered, payment_ref,
-         shift["id"] if shift else None, client_ref, rh, terminal_id),
+         shift["id"] if shift else None, client_ref, rh, terminal_id, order_type, guests),
     ).lastrowid
 
     for mi, qty in p["lines"]:

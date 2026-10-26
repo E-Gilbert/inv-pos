@@ -25,8 +25,8 @@ Logins and failed logins, PIN changes/resets, staff create/edit (role, status), 
 ## Payments
 No payment is "verified" by the system: the cashier confirms cash, the M-Pesa message or the card slip. This is shown on screen. Daraja/STK push integration needs Safaricom credentials and must verify callbacks server-side before an order is marked paid.
 
-## Checks run for this release
-* `pytest`: 39 tests, Python 3.10 and 3.13.
+## Checks run (v0.3)
+* `pytest`: 45 tests, Python 3.10 and 3.13.
 * `ruff` (E, F, W, B): clean. `bandit`: clean apart from the reviewed B608.
 * `pip-audit -r requirements.txt`: no known vulnerabilities (dependencies upgraded: FastAPI 0.145, Starlette 1.3.1, python-multipart 0.0.31, cryptography 50.0.1).
 * Browser end-to-end runs (Chromium, desktop 1366×800 and Android-size 412×915 touch): login, forced PIN change, open day, shift, scan/search, discount, cash and M-Pesa sales, refund with restock, waste, purchase order with partial receipt, reports, workbook analysis and import. No console errors.

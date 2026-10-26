@@ -20,7 +20,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("CFC_DB", os.path.join(BASE_DIR, "data", "cfc.db"))
 DATA_DIR = os.path.dirname(DB_PATH)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------- v1 (original v0.1 schema)
 SCHEMA_V1 = """
@@ -170,6 +170,11 @@ DEFAULT_SETTINGS = {
     "cost_method": "manual",
     "require_shift": "1",
     "session_idle_minutes": "720",
+    # Reporting (MICROS-style): order types offered at checkout, whether to ask for a guest count,
+    # and serving periods as "Name=HH:MM-HH:MM;..." (a period may run past midnight).
+    "order_types": "Dine in,Takeaway,Delivery",
+    "ask_guests": "0",
+    "serving_periods": "Breakfast=05:00-11:00;Lunch=11:00-16:00;Dinner=16:00-05:00",
 }
 
 
@@ -302,7 +307,19 @@ def _migrate_to_2(c):
     c.execute("CREATE UNIQUE INDEX ux_one_open_day ON days(status) WHERE status = 'open'")
 
 
-MIGRATIONS = {2: _migrate_to_2}
+def _migrate_to_3(c):
+    """Reporting dimensions: order type and guest count per check, major group per category."""
+    if "order_type" not in _cols(c, "orders"):
+        c.execute("ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'Dine in'")
+    if "guests" not in _cols(c, "orders"):
+        c.execute("ALTER TABLE orders ADD COLUMN guests INTEGER CHECK (guests IS NULL OR guests BETWEEN 0 AND 500)")
+    if "major_group" not in _cols(c, "categories"):
+        c.execute("ALTER TABLE categories ADD COLUMN major_group TEXT")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_orders_created ON orders(created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_refunds_day ON refunds(day_id)")
+
+
+MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3}
 
 
 def init_db():

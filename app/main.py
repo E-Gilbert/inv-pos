@@ -23,13 +23,13 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import importer, licence, logic, workbook
+from . import importer, licence, logic, reports, workbook
 from .db import BASE_DIR, DATA_DIR, DEFAULT_SETTINGS, audit, get_setting, init_db, now, setting_float, tx
 from .logic import Conflict, RuleError
 from .security import (allowed, hash_pin, hash_token, new_token, permissions_for, throttle,
                        valid_pin_format, weak_pin)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 STATIC = os.path.join(BASE_DIR, "static")
 MAX_UPLOAD = 5 * 1024 * 1024
 MAX_BODY = 6 * 1024 * 1024
@@ -309,6 +309,8 @@ class NewOrder(BaseModel):
     discount: Optional[Discount] = None
     approver_pin: Optional[str] = Field(default=None, max_length=12)
     client_ref: Optional[str] = Field(default=None, min_length=8, max_length=64)
+    order_type: Optional[str] = Field(default=None, max_length=30)
+    guests: Optional[int] = Field(default=None, ge=0, le=500)
 
 
 def receipt(c, order_id):
@@ -336,7 +338,7 @@ def new_order(body: NewOrder, staff=Depends(need("pos.sell"))):
         oid, dup = logic.create_order(
             c, staff, [i.model_dump() for i in body.items], body.payment_method, body.amount_tendered,
             body.payment_ref, body.discount.model_dump() if body.discount else None, body.approver_pin,
-            body.client_ref, staff["terminal"])
+            body.client_ref, staff["terminal"], body.order_type, body.guests)
         out = receipt(c, oid)
         out["duplicate"] = dup
         return out
@@ -711,6 +713,48 @@ def period(date_from: str, date_to: str, staff=Depends(need("reports.view"))):
         return logic.period_report(c, date_from, date_to)
 
 
+@app.get("/api/reports/catalog")
+def report_catalog(staff=Depends(need("reports.view"))):
+    return {"reports": [{"key": k, "group": g, "title": t} for k, (g, t, _) in reports.CATALOG.items()],
+            "eod_pack": reports.EOD_PACK}
+
+
+@app.get("/api/reports/run/{key}")
+def report_run(key: str, date_from: str, date_to: str, format: Literal["json", "csv"] = "json",
+               staff=Depends(need("reports.view"))):
+    if key not in reports.CATALOG:
+        raise HTTPException(404, "Unknown report.")
+    with tx() as c:
+        rep = reports.run(c, key, date_from, date_to)
+        if format == "csv":
+            if not allowed(staff["role"], "data.export"):
+                raise HTTPException(403, "You don't have permission to export.")
+            audit(c, staff["id"], "export.report", key, None, {"from": date_from, "to": date_to}, staff["ip"])
+    if format == "csv":
+        return Response(reports.to_csv(rep), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="cfc-{key}-{date_from}_{date_to}.csv"'})
+    return rep
+
+
+class Category(BaseModel):
+    major_group: Optional[str] = Field(default=None, max_length=40)
+    sort: int = Field(default=0, ge=0, le=9999)
+
+
+@app.put("/api/categories/{cid}")
+def edit_category(cid: int, body: Category, staff=Depends(need("catalog.edit"))):
+    with tx() as c:
+        old = c.execute("SELECT * FROM categories WHERE id = ?", (cid,)).fetchone()
+        if not old:
+            raise HTTPException(404, "Not found.")
+        mg = (body.major_group or "").strip() or None
+        c.execute("UPDATE categories SET major_group = ?, sort = ? WHERE id = ?", (mg, body.sort, cid))
+        if (old["major_group"] or None) != mg or old["sort"] != body.sort:
+            audit(c, staff["id"], "category.edit", "category", cid,
+                  {"name": old["name"], "major_group": [old["major_group"], mg], "sort": [old["sort"], body.sort]})
+    return {"ok": True}
+
+
 @app.get("/api/reports/valuation")
 def valuation(staff=Depends(need("reports.view"))):
     with tx() as c:
@@ -990,6 +1034,24 @@ class Settings(BaseModel):
     cost_method: Literal["manual", "last_purchase", "weighted_average"] = "manual"
     require_shift: bool = True
     session_idle_minutes: int = Field(default=720, ge=5, le=1440)
+    order_types: str = Field(default="Dine in,Takeaway,Delivery", min_length=1, max_length=200)
+    ask_guests: bool = False
+    serving_periods: str = Field(default=DEFAULT_SETTINGS["serving_periods"], max_length=300)
+
+    @field_validator("order_types")
+    @classmethod
+    def _types(cls, v):
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts or any(len(p) > 30 for p in parts) or len(set(parts)) != len(parts):
+            raise ValueError("list order types separated by commas, each up to 30 characters, no repeats")
+        return ",".join(parts)
+
+    @field_validator("serving_periods")
+    @classmethod
+    def _periods(cls, v):
+        from .reports import parse_periods
+        parse_periods(v)  # raises ValueError with a readable message
+        return v.strip()
 
 
 @app.put("/api/settings")

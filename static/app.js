@@ -10,7 +10,7 @@
 
 const S = {
   token: null, staff: null, state: null, perms: new Set(), menu: { categories: [], items: [] },
-  cart: [], discount: null, cat: "all", view: "dash", setupTab: "menu", reportTab: "daily", reportDay: null,
+  cart: [], discount: null, cat: "all", view: "dash", setupTab: "menu", reportTab: "hub", reportDay: null, orderType: null, rptFrom: null, rptTo: null, rptKey: "sales",
   stockFilter: "all", stockSearch: "", pending: null,
 };
 const $app = document.getElementById("app");
@@ -372,6 +372,8 @@ function viewPOS(el) {
   renderCart();
 }
 
+const orderTypes = () => (S.state.settings.order_types || "Dine in").split(",").map((x) => x.trim()).filter(Boolean);
+const curOrderType = () => (orderTypes().includes(S.orderType) ? S.orderType : orderTypes()[0]);
 function cartChanged() { S.pending = null; renderCart(); }
 function addToCart(id) {
   const line = S.cart.find((l) => l.id === id);
@@ -404,6 +406,7 @@ function renderCart() {
   const label = S.state.settings.tax_label || "VAT";
   el.innerHTML = `
     <h3>Current order</h3>
+    <div class="otypes" role="group" aria-label="Order type">${orderTypes().map((t) => `<button data-ot="${esc(t)}" class="${t === curOrderType() ? "active" : ""}">${esc(t)}</button>`).join("")}</div>
     <div class="lines">
       ${S.cart.map((l, i) => `
         <div class="line">
@@ -430,7 +433,8 @@ function renderCart() {
     const l = S.cart[b.dataset.m]; l.qty--; if (l.qty <= 0) S.cart.splice(b.dataset.m, 1); cartChanged();
   }));
   el.querySelectorAll("[data-pay]").forEach((b) => b.addEventListener("click", () => payModal(b.dataset.pay)));
-  document.getElementById("clear")?.addEventListener("click", () => { S.cart = []; S.discount = null; cartChanged(); });
+  el.querySelectorAll("[data-ot]").forEach((b) => b.addEventListener("click", () => { S.orderType = b.dataset.ot; cartChanged(); }));
+  document.getElementById("clear")?.addEventListener("click", () => { S.cart = []; S.discount = null; S.orderType = null; cartChanged(); });
   document.getElementById("disc")?.addEventListener("click", discountModal);
   document.getElementById("retry")?.addEventListener("click", () => submitOrder(S.pending.body));
 }
@@ -478,6 +482,7 @@ function payModal(method) {
   const m = modal(`
     <h2>${{ cash: "Cash", mpesa: "M-Pesa", card: "Card" }[method]} payment · ${money(total)}</h2>
     ${body}
+    ${S.state.settings.ask_guests === "1" ? `<label>Guests (covers)</label><input id="gst" type="number" min="0" max="500" step="1" inputmode="numeric" placeholder="optional" style="max-width:140px">` : ""}
     ${needsApproval() ? `<label>Manager PIN to approve the discount</label><input id="apin" type="password" inputmode="numeric" maxlength="6">` : ""}
     <div class="err" id="perr"></div>
     <div class="actions"><button class="btn" id="cancel">Cancel</button><button class="btn primary big" id="confirm">Confirm payment</button></div>`);
@@ -494,7 +499,8 @@ function payModal(method) {
       amount_tendered: method === "cash" ? Number(tend.value || 0) : null,
       payment_ref: m.querySelector("#ref")?.value || null,
       discount: S.discount, approver_pin: m.querySelector("#apin")?.value || null,
-      client_ref: uuid(),
+      client_ref: uuid(), order_type: curOrderType(),
+      guests: m.querySelector("#gst")?.value ? Number(m.querySelector("#gst").value) : null,
     };
     submitOrder(body, m);
   };
@@ -510,7 +516,7 @@ async function submitOrder(body, m) {
   if (btn) btn.disabled = true;
   try {
     const order = await api("/api/orders", { method: "POST", json: body, timeout: 15000 });
-    S.cart = []; S.discount = null; S.pending = null;
+    S.cart = []; S.discount = null; S.pending = null; S.orderType = null;  // next check starts on the default order type
     renderCart();
     receiptModal(order);
     refreshState().then(() => { if (S.view === "pos") document.querySelector("#shiftbtn") && (document.querySelector("#shiftbtn").textContent = "Shift ✓"); }).catch(() => {});
@@ -535,6 +541,7 @@ function receiptHTML(o) {
     <div class="c"><b style="font-size:15px">${esc(S.state.business_name)}</b><br>${esc(o.business_address || s.business_address || "")}
       ${o.business_pin ? `<br>PIN: ${esc(o.business_pin)}` : ""}</div><hr>
     ${L("Receipt #" + o.number, esc(o.business_date))}
+    ${o.order_type ? L(esc(o.order_type), o.guests ? `${Number(o.guests)} guest(s)` : "") : ""}
     ${L(esc((o.created_at || "").slice(11, 16)), "Served by " + esc(o.cashier))}<hr>
     ${o.items.map((i) => L(`${i.qty} × ${esc(i.name)}`, Number(i.price * i.qty).toLocaleString())).join("")}<hr>
     ${o.discount ? L("Subtotal", money(o.subtotal)) + L("Discount", "−" + money(o.discount)) : ""}
@@ -1030,10 +1037,11 @@ async function viewCloseDay(el) {
 
 // ------------------------------------------------------------------ reports
 async function viewReports(el) {
-  const tabs = [["daily", "Daily"], ["period", "Sales & profit"], ["valuation", "Stock valuation"]];
+  const tabs = [["hub", "Reports"], ["daily", "Day close reports"], ["period", "Sales & profit"], ["valuation", "Stock valuation"]];
   el.innerHTML = `<div class="tabs">${tabs.map(([k, l]) => `<button data-t="${k}" class="${S.reportTab === k ? "active" : ""}">${l}</button>`).join("")}</div><div id="rv"></div>`;
   el.querySelectorAll("[data-t]").forEach((b) => b.addEventListener("click", () => { S.reportTab = b.dataset.t; S.reportDay = null; viewReports(el); }));
   const rv = document.getElementById("rv");
+  if (S.reportTab === "hub") return reportHub(rv);
   if (S.reportTab === "period") return reportPeriod(rv);
   if (S.reportTab === "valuation") return reportValuation(rv);
   if (S.reportDay) return viewReport(rv, S.reportDay, el);
@@ -1165,10 +1173,101 @@ async function reportValuation(rv) {
   document.getElementById("vx").onclick = () => download("/api/export/stock.csv", "stock.csv");
 }
 
+
+// ------------------------------------------------------------------ reports hub (MICROS-style)
+const fmtCell = (v, t, row) => {
+  if (t === "auto") t = row?._type || "text";
+  if (v == null || v === "") return t === "text" ? "" : "–";
+  if (t === "money") return Number(v).toLocaleString("en-KE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (t === "pct") return `${v}%`;
+  if (t === "int") return Number(v).toLocaleString("en-KE");
+  return esc(v);
+};
+
+function reportBodyHTML(rep) {
+  return `<h2>${esc(rep.business_name)} · ${esc(rep.title)}</h2>
+    <div class="small muted" style="margin-bottom:8px">${esc(rep.from)}${rep.from === rep.to ? "" : " to " + esc(rep.to)} · ${rep.days} business day(s)</div>
+    ${rep.notes.map((n) => `<div class="note">${esc(n)}</div>`).join("")}
+    ${rep.sections.map((s) => `<h3 style="margin-top:14px">${esc(s.title)}</h3>
+      <div class="tablewrap"><table><thead><tr>${s.columns.map((c) => `<th class="${c.type === "text" ? "" : "num"}">${esc(c.label)}</th>`).join("")}</tr></thead><tbody>
+      ${s.rows.map((r) => `<tr>${s.columns.map((c) => `<td class="${c.type === "text" ? "" : "num"}">${fmtCell(r[c.key], c.type, r)}</td>`).join("")}</tr>`).join("")
+        || `<tr><td colspan="${s.columns.length}" class="muted">Nothing in this period.</td></tr>`}
+      ${s.totals ? `<tr class="totrow">${s.columns.map((c) => `<td class="${c.type === "text" ? "" : "num"}"><b>${fmtCell(s.totals[c.key], c.type, s.totals)}</b></td>`).join("")}</tr>` : ""}
+      </tbody></table></div>${s.note ? `<div class="small muted">${esc(s.note)}</div>` : ""}`).join("")}`;
+}
+
+async function reportHub(rv) {
+  let cat;
+  try { cat = await api("/api/reports/catalog"); } catch (e) { return fail(e); }
+  S.rptFrom = S.rptFrom || (S.state.day ? S.state.day.business_date : today());
+  S.rptTo = S.rptTo || S.rptFrom;
+  const groups = {};
+  cat.reports.forEach((r) => (groups[r.group] = groups[r.group] || []).push(r));
+  rv.innerHTML = `<div class="panel">
+    <div class="row" style="align-items:end">
+      <div class="shrink"><label>From</label><input id="hf" type="date" value="${esc(S.rptFrom)}"></div>
+      <div class="shrink"><label>To</label><input id="ht" type="date" value="${esc(S.rptTo)}"></div>
+      <div class="shrink quick" style="margin:0">${[["today", "Today"], ["yday", "Yesterday"], ["week", "Last 7 days"], ["month", "This month"]].map(([k, l]) => `<button class="btn" data-qr="${k}">${l}</button>`).join("")}</div>
+    </div>
+    <div class="rgroups">${Object.entries(groups).map(([g, list]) => `<fieldset class="rgroup"><legend>${esc(g)}</legend>
+      ${list.map((r) => `<button class="btn ${S.rptKey === r.key ? "primary" : ""}" data-rk="${r.key}">${esc(r.title)}</button>`).join("")}</fieldset>`).join("")}</div>
+    <div class="row" style="margin-top:6px"><div class="shrink"><button class="btn" id="hp">Print</button></div>
+      ${can("data.export") ? `<div class="shrink"><button class="btn" id="hx">Export CSV</button></div>` : ""}
+      <div class="shrink"><button class="btn" id="heod" title="Sales, tax, cashier, employee, category, menu item, discounts, voids, refunds">Print end-of-day pack</button></div></div>
+  </div><div class="panel" id="hout"><div class="empty">Loading…</div></div>`;
+  const qs = () => `date_from=${encodeURIComponent(S.rptFrom)}&date_to=${encodeURIComponent(S.rptTo)}`;
+  let current = null;
+  const show = async () => {
+    const out = document.getElementById("hout");
+    try { current = await api(`/api/reports/run/${S.rptKey}?${qs()}`); out.innerHTML = reportBodyHTML(current); }
+    catch (e) { current = null; out.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  const setDates = (f, t) => { S.rptFrom = f; S.rptTo = t; document.getElementById("hf").value = f; document.getElementById("ht").value = t; show(); };
+  document.getElementById("hf").onchange = (e) => { S.rptFrom = e.target.value; if (S.rptTo < S.rptFrom) document.getElementById("ht").value = S.rptTo = S.rptFrom; show(); };
+  document.getElementById("ht").onchange = (e) => { S.rptTo = e.target.value; show(); };
+  rv.querySelectorAll("[data-qr]").forEach((b) => b.addEventListener("click", () => {
+    const t = today();
+    ({ today: () => setDates(t, t), yday: () => setDates(daysAgo(1), daysAgo(1)), week: () => setDates(daysAgo(6), t),
+       month: () => setDates(t.slice(0, 8) + "01", t) })[b.dataset.qr]();
+  }));
+  rv.querySelectorAll("[data-rk]").forEach((b) => b.addEventListener("click", () => {
+    S.rptKey = b.dataset.rk; rv.querySelectorAll("[data-rk]").forEach((x) => x.classList.toggle("primary", x === b)); show();
+  }));
+  document.getElementById("hp").onclick = () => current && printHTML(`<div class="printrep">${reportBodyHTML(current)}</div>`);
+  document.getElementById("hx")?.addEventListener("click", () => download(`/api/reports/run/${S.rptKey}?${qs()}&format=csv`, `${S.rptKey}-${S.rptFrom}_${S.rptTo}.csv`));
+  document.getElementById("heod").onclick = async () => {
+    try {
+      const reps = await Promise.all(cat.eod_pack.map((k) => api(`/api/reports/run/${k}?${qs()}`)));
+      printHTML(reps.map((r, i) => `<div class="printrep" style="${i ? "page-break-before:always" : ""}">${reportBodyHTML(r)}</div>`).join(""));
+    } catch (e) { fail(e); }
+  };
+  show();
+}
+
+async function setupCategories(sv) {
+  const { categories } = await api("/api/menu");
+  sv.innerHTML = `<div class="panel" style="max-width:720px"><h2>Categories</h2>
+    <div class="info">Categories are the menu's <b>family groups</b> (Mandi, Rice, Drinks…). Give each a <b>major group</b> (e.g. Food, Beverage) for the major-group sales report. Sort order sets the POS tab order.</div>
+    <table><thead><tr><th>Category</th><th>Major group</th><th style="width:110px">Sort</th><th></th></tr></thead><tbody>
+    ${categories.map((c) => `<tr><td><b>${esc(c.name)}</b></td><td><input data-mg="${c.id}" value="${esc(c.major_group || "")}" list="mglist" maxlength="40" placeholder="e.g. Food"></td>
+      <td><input data-so="${c.id}" type="number" min="0" max="9999" value="${Number(c.sort) || 0}"></td><td><button class="btn" data-cs="${c.id}">Save</button></td></tr>`).join("")
+      || `<tr><td colspan="4" class="muted">No categories yet: they are created with menu items.</td></tr>`}
+    </tbody></table>
+    <datalist id="mglist">${[...new Set(["Food", "Beverage", ...categories.map((c) => c.major_group).filter(Boolean)])].map((g) => `<option>${esc(g)}</option>`).join("")}</datalist></div>`;
+  sv.querySelectorAll("[data-cs]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.dataset.cs;
+    try {
+      await api(`/api/categories/${id}`, { method: "PUT", json: { major_group: sv.querySelector(`[data-mg="${id}"]`).value || null,
+        sort: Number(sv.querySelector(`[data-so="${id}"]`).value || 0) } });
+      toast("Saved"); await loadMenu();
+    } catch (e) { fail(e); }
+  }));
+}
+
 // ------------------------------------------------------------------ setup
 async function viewSetup(el) {
   const tabs = [];
-  if (can("catalog.edit")) tabs.push(["menu", "Menu & recipes"], ["ingredients", "Items & thresholds"]);
+  if (can("catalog.edit")) tabs.push(["menu", "Menu & recipes"], ["categories", "Categories"], ["ingredients", "Items & thresholds"]);
   if (can("data.import")) tabs.push(["excel", "Import / export"]);
   if (can("staff.manage")) tabs.push(["staff", "Staff"]);
   if (can("settings.edit")) tabs.push(["settings", "Settings"]);
@@ -1179,7 +1278,7 @@ async function viewSetup(el) {
   el.querySelectorAll("[data-t]").forEach((b) => b.addEventListener("click", () => { S.setupTab = b.dataset.t; viewSetup(el); }));
   const sv = document.getElementById("sv");
   try {
-    await ({ menu: setupMenu, ingredients: setupIngredients, excel: setupExcel, staff: setupStaff, settings: setupSettings,
+    await ({ menu: setupMenu, categories: setupCategories, ingredients: setupIngredients, excel: setupExcel, staff: setupStaff, settings: setupSettings,
              audit: setupAudit, licence: setupLicence }[S.setupTab])(sv);
   } catch (e) { fail(e); }
 }
@@ -1422,6 +1521,10 @@ async function setupSettings(sv) {
     <div class="row"><div><label>Cashier may discount up to % without a manager</label><input id="md" type="number" min="0" max="100" step="1" value="${esc(s.cashier_max_discount_pct)}"></div>
       <div><label>Cash shift before selling</label>${sel("rs", [["1", "required"], ["0", "optional"]], s.require_shift)}</div>
       <div><label>Log out after idle (minutes)</label><input id="si" type="number" min="5" max="1440" value="${esc(s.session_idle_minutes)}"></div></div>
+    <h3 style="margin-top:16px">Reporting</h3>
+    <div class="row"><div><label>Order types (comma separated)</label><input id="ot" value="${esc(s.order_types)}" maxlength="200"></div>
+      <div><label>Ask for guest count at payment</label>${sel("ag", [["0", "no"], ["1", "yes (optional field)"]], s.ask_guests)}</div></div>
+    <label>Serving periods (Name=HH:MM-HH:MM; separated by ;)</label><input id="sp" value="${esc(s.serving_periods)}" maxlength="300" placeholder="Breakfast=05:00-11:00;Lunch=11:00-16:00;Dinner=16:00-05:00">
     <h3 style="margin-top:16px">Stock</h3>
     <div class="row"><div><label>Closing tolerance (%)</label><input id="tp" type="number" step="0.5" min="0" max="20" value="${esc(s.variance_tolerance_pct)}"></div>
       <div><label>Critical = % of reorder level (if no own level)</label><input id="cp" type="number" min="0" max="100" value="${esc(s.critical_pct_of_reorder)}"></div>
@@ -1436,7 +1539,8 @@ async function setupSettings(sv) {
         business_name: v("bn"), business_address: v("ba"), business_pin: v("bp"), receipt_footer: v("rf"),
         variance_tolerance_pct: Number(v("tp")), tax_rate_pct: Number(v("tr") || 0), tax_inclusive: v("ti") === "1", tax_label: v("tl") || "VAT",
         cashier_max_discount_pct: Number(v("md") || 0), critical_pct_of_reorder: Number(v("cp") || 0), reorder_cover_days: Number(v("rc") || 0),
-        cost_method: v("cm"), require_shift: v("rs") === "1", session_idle_minutes: Number(v("si") || 720) } });
+        cost_method: v("cm"), require_shift: v("rs") === "1", session_idle_minutes: Number(v("si") || 720),
+        order_types: v("ot"), ask_guests: v("ag") === "1", serving_periods: v("sp") } });
       await refreshState(); toast("Saved"); render();
     } catch (e) { document.getElementById("serr").textContent = e.message; }
   };
