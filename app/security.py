@@ -2,7 +2,7 @@
 
 PINs are short (4-6 digits), so a plain hash would be reversed instantly from a stolen
 database or backup. They are stored as HMAC-SHA256 with a server secret ("pepper") that
-lives in data/secret.key, outside the database. Keep that file out of git and back it up
+lives in data/secret.key (or the INVPOS_SECRET environment variable in cloud mode), outside the database. Keep that file out of git and back it up
 separately from the database: without it, nobody can log in (see scripts/reset_admin_pin.py).
 
 Because staff log in with the PIN alone (fast at a busy till), the hash must be deterministic
@@ -25,6 +25,20 @@ _secret = None
 def secret():
     global _secret
     if _secret is None:
+        env = os.environ.get("INVPOS_SECRET", "").strip()
+        if env:
+            # Cloud hosts (Render) wipe the disk on every deploy, so the pepper must live in the
+            # environment there. 64 hex characters: python -c "import secrets; print(secrets.token_hex(32))"
+            try:
+                _secret = bytes.fromhex(env)
+            except ValueError:
+                raise RuntimeError("INVPOS_SECRET must be hex (64 characters).") from None
+            if len(_secret) < 32:
+                raise RuntimeError("INVPOS_SECRET is too short: use 64 hex characters.")
+            return _secret
+        if os.environ.get("DATABASE_URL", "").strip():
+            raise RuntimeError("Cloud mode (DATABASE_URL set) needs INVPOS_SECRET in the environment; a secret.key "
+                               "file would be lost on the next deploy and every PIN would stop working.")
         if not os.path.exists(SECRET_FILE):
             os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
             fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -57,7 +71,7 @@ def weak_pin(pin: str) -> bool:
         return True
     d = [int(x) for x in p if x.isdigit()]
     if len(d) == len(p) and len(d) > 1:
-        steps = {b - a for a, b in zip(d, d[1:])}
+        steps = {b - a for a, b in zip(d, d[1:], strict=False)}
         if steps in ({1}, {-1}):
             return True
     return p in {"1212", "2580", "0852", "1122", "6969", "1004", "2000", "2026"}
@@ -158,9 +172,20 @@ PERMISSIONS = {
 }
 
 
+# The till side. POS_MODULE=off turns it off (inventory-only mode, e.g. a restaurant that keeps
+# selling on its existing POS and uses INV-POS for stock, purchasing and reports).
+POS_PERMISSIONS = frozenset({"pos.sell", "pos.void", "pos.refund", "pos.discount_approve", "shift.own", "shift.manage"})
+
+
+def pos_enabled():
+    return os.environ.get("POS_MODULE", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
 def allowed(role, perm):
+    if perm in POS_PERMISSIONS and not pos_enabled():
+        return False
     return role in PERMISSIONS[perm]
 
 
 def permissions_for(role):
-    return sorted(p for p, roles in PERMISSIONS.items() if role in roles)
+    return sorted(p for p in PERMISSIONS if allowed(role, p))

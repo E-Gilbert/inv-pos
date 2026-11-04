@@ -11,14 +11,14 @@
 const S = {
   token: null, staff: null, state: null, perms: new Set(), menu: { categories: [], items: [] },
   cart: [], discount: null, cat: "all", view: "dash", setupTab: "menu", reportTab: "hub", reportDay: null, orderType: null, rptFrom: null, rptTo: null, rptKey: "sales",
-  stockFilter: "all", stockSearch: "", pending: null,
+  stockFilter: "all", stockSearch: "", pending: null, tab: null, tabs: [], sendBatch: null,
 };
 const $app = document.getElementById("app");
 
 // ------------------------------------------------------------------ helpers
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const cur = () => (S.state?.settings?.currency || "KES");
-const money = (n) => cur() + " " + Number(n || 0).toLocaleString("en-KE", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+const money = (n) => { const v = Number(n || 0); return cur() + " " + v.toLocaleString("en-KE", { minimumFractionDigits: Number.isInteger(Math.round(v * 100) / 100) ? 0 : 2, maximumFractionDigits: 2 }); };
 const big = { g: ["kg", 1000], ml: ["L", 1000], pcs: ["pcs", 1] };
 const bigUnit = (u) => (big[u] || ["", 1])[0];
 const toBig = (q, u) => (q == null ? null : q / (big[u] || ["", 1])[1]);
@@ -92,7 +92,7 @@ function modal(html, cls = "") {
   bg.addEventListener("click", (e) => { if (e.target === bg && !bg.dataset.locked) closeModal(); });
   document.body.appendChild(bg);
   const f = bg.querySelector("[autofocus]");
-  if (f) setTimeout(() => f.focus(), 30);
+  if (f) setTimeout(() => { if (!bg.contains(document.activeElement)) f.focus(); }, 30);  // never steal focus from a field already in use
   return bg;
 }
 const closeModal = () => document.getElementById("modal")?.remove();
@@ -117,11 +117,13 @@ async function download(path, name) {
 // Connectivity indicator (LAN server reachability, not internet).
 let offlineShown = false;
 async function ping() {
-  try { await fetch("/api/health", { cache: "no-store" }); if (offlineShown) { document.getElementById("offline")?.remove(); offlineShown = false; } }
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);  // a frozen server must count as "down"
+  try { const r = await fetch("/api/health", { cache: "no-store", signal: ctl.signal }); clearTimeout(t); if (!r.ok) throw new Error(); if (offlineShown) { document.getElementById("offline")?.remove(); offlineShown = false; } }
   catch {
     if (!offlineShown) {
       const d = document.createElement("div"); d.id = "offline"; d.className = "offline";
-      d.textContent = "No connection to the POS server — sales are paused until it's back. Nothing is lost.";
+      d.textContent = "No connection to the POS server — sales are paused until it's back. Nothing is lost. " +
+        "If the server froze it restarts itself within about 3 minutes; this message disappears when it's back.";
       document.body.appendChild(d); offlineShown = true;
     }
   }
@@ -145,7 +147,8 @@ async function refreshState() {
 async function loadMenu() { if (can("pos.sell") || can("stock.view")) S.menu = await api("/api/menu"); }
 function logout(silent) {
   if (!silent && S.token) api("/api/logout", { method: "POST" }).catch(() => {});
-  S.token = null; S.staff = null; S.cart = []; S.discount = null; S.perms = new Set();
+  S.token = null; S.staff = null; S.cart = []; S.discount = null; S.perms = new Set(); S.tab = null; S.tabs = [];
+  store.set("cfc_draft", null); S.draftChecked = false;
   store.set("cfc_token", null);
   closeModal();
   renderLogin();
@@ -253,7 +256,7 @@ function render() {
     ${licenceBanner()}
     <div class="daybar ${day ? "open" : "closed"}">
       ${day ? `<b>Day open:</b> ${esc(day.business_date)} <span class="muted small">since ${esc(day.opened_at?.slice(11, 16) || "")}</span>`
-            : `<b>No day open.</b> Sales and stock entries are locked until a manager opens the day.
+            : `<b>No day open.</b> ${S.state.modules?.pos === false ? "Stock entries are" : "Sales and stock entries are"} locked until a manager opens the day.
                ${can("day.manage") ? `<button class="btn" id="goopen">Open day</button>` : ""}`}
     </div>
     <main id="view"></main>`;
@@ -275,7 +278,7 @@ function globalKeys(e) {
   if (S.view !== "pos" || document.getElementById("modal")) return;
   const map = { F4: "cash", F7: "mpesa", F8: "card" };
   if (e.key === "F2") { e.preventDefault(); document.getElementById("scan")?.focus(); }
-  else if (map[e.key] && S.cart.length && S.state.day) { e.preventDefault(); payModal(map[e.key]); }
+  else if (map[e.key] && S.state.day && (S.cart.length || (S.tab && S.tab.lines.some((l) => !l.removed_at)))) { e.preventDefault(); payModal(map[e.key]); }
 }
 
 // ------------------------------------------------------------------ dashboard
@@ -288,6 +291,7 @@ async function viewDashboard(el) {
   const t = d.today;
   const maxTrend = Math.max(1, ...(d.trend || []).map((x) => x.sales));
   el.innerHTML = `
+    <div id="setupck"></div>
     ${t ? `<div class="kpis">
       <div class="kpi"><div class="l">Sales today (collected)</div><div class="v">${money(t.collected - t.refunds)}</div></div>
       <div class="kpi"><div class="l">Orders</div><div class="v">${t.orders}</div></div>
@@ -320,15 +324,51 @@ async function viewDashboard(el) {
       </div>
     </div>`;
   el.querySelectorAll("[data-f]").forEach((b) => b.addEventListener("click", () => { S.stockFilter = b.dataset.f; S.view = "stock"; render(); }));
+  if (isManager()) setupChecklist(document.getElementById("setupck"));
+}
+
+async function setupChecklist(box) {
+  let st;
+  try { st = await api("/api/setup/status"); } catch { return; }
+  const todo = st.items.filter((i) => !i.done);
+  if (!todo.length || !box) return;
+  box.innerHTML = `<div class="panel" style="margin-bottom:14px"><h3>Getting ready to trade · ${st.items.length - todo.length} of ${st.items.length} done</h3>
+    <ul class="checklist">${st.items.map((i) => `<li>${i.done ? "✅" : "⬜"} ${esc(i.label)}</li>`).join("")}</ul>
+    ${st.flagged_items.length ? `<div class="small">Menu items to review: ${st.flagged_items.map((f) => esc(f.name)).join(", ")}.
+      ${can("catalog.edit") ? `<button class="btn" id="gorev">Review now</button>` : ""}</div>` : ""}</div>`;
+  box.querySelector("#gorev")?.addEventListener("click", () => { S.view = "setup"; S.setupTab = "menu"; S.menuFlag = true; render(); });
 }
 
 // ------------------------------------------------------------------ POS
-function viewPOS(el) {
+// Two ways to sell:
+//  * Counter sale: tap items, take payment straight away (takeaway, quick service).
+//  * Open check (MICROS "guest check"): open a check for a table/name, send items to the kitchen
+//    in rounds, take payment later. Nothing is sold and no stock moves until the check is paid.
+const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const todayWD = () => { const d = S.state.day?.business_date; return d ? WD[(new Date(d + "T12:00:00").getDay() + 6) % 7] : null; };
+const daysOf = (i) => (i.available_days || "").split(",").map((x) => x.trim()).filter(Boolean);
+const sellableToday = (i) => { const d = daysOf(i); return !d.length || !todayWD() || d.includes(todayWD()); };
+const groupName = (i) => i.variant_group || i.name;
+const variantName = (i) => i.variant || i.name;
+const printTickets = () => store.get("cfc_print_ticket") !== "0";
+
+async function loadTabs() { try { S.tabs = await api("/api/tabs"); } catch { S.tabs = S.tabs || []; } }
+
+async function viewPOS(el) {
+  await loadTabs();
+  if (S.tab) S.tab = S.tabs.find((t) => t.id === S.tab.id) || null;
+  restoreDraft();
   const cats = S.menu.categories.filter((c) => S.menu.items.some((i) => i.category_id === c.id));
-  const items = S.menu.items.filter((i) => S.cat === "all" || i.category_id === S.cat);
   const needShift = S.state.settings.require_shift === "1" && !S.state.shift && S.state.day;
   el.innerHTML = `
-    ${needShift ? `<div class="note"><b>Open your cash shift to start selling.</b> <button class="btn primary" id="os">Open shift</button></div>` : ""}
+    ${needShift ? `<div class="note"><b>Open your cash shift before taking payment.</b> Servers can still open checks and send orders.
+      <button class="btn primary" id="os">Open shift</button></div>` : ""}
+    <div class="tabsbar" aria-label="Open checks">
+      <button class="${S.tab ? "" : "active"}" id="counter">Counter sale</button>
+      ${S.tabs.map((t) => `<button data-tab="${t.id}" class="${S.tab?.id === t.id ? "active" : ""}" title="${esc(t.server)} · ${esc(t.order_type)}">
+        <b>${esc(t.label)}</b> <span class="small">${money(t.total)}</span>${t.unsent ? ` <span class="dot" title="items not sent"></span>` : ""}</button>`).join("")}
+      ${S.state.day ? `<button class="new" id="newtab">+ New check</button>` : ""}
+    </div>
     <div class="pos">
       <div>
         <div class="scan"><input id="scan" placeholder="Scan barcode or type item name / SKU, then Enter  (F2)" autocomplete="off" aria-label="Scan or search"></div>
@@ -341,22 +381,50 @@ function viewPOS(el) {
       </div>
       <div class="panel cart" id="cart"></div>
     </div>`;
-  const drawItems = (list) => {
-    document.getElementById("items").innerHTML = list.map((i) => `<button class="item ${i.stock_status === "out" ? "out" : ""}" data-i="${i.id}">
-        <span class="n">${esc(i.name)}</span>
-        <span><span class="p">${money(i.price)}</span>
-          ${i.stock_status ? `<div class="stk">${stBadge(i.stock_status)}</div>` : ""}
-          ${i.recipe_lines ? "" : `<div class="nr">no recipe – stock not tracked</div>`}</span>
-      </button>`).join("") || `<div class="empty">No menu items. ${can("catalog.edit") ? "Add them in Setup or import the Excel sheet." : ""}</div>`;
-    el.querySelectorAll(".item").forEach((b) => b.addEventListener("click", () => addToCart(Number(b.dataset.i))));
+  const inCat = S.menu.items.filter((i) => S.cat === "all" || i.category_id === S.cat);
+  const drawTiles = (list, grouped) => {
+    const groups = [];
+    const byKey = {};
+    list.forEach((i) => {
+      const k = grouped && i.variant_group ? `${i.category_id}|${i.variant_group}` : `#${i.id}`;
+      if (!byKey[k]) { byKey[k] = []; groups.push(byKey[k]); }
+      byKey[k].push(i);
+    });
+    document.getElementById("items").innerHTML = groups.map((g, gi) => {
+      const first = g[0];
+      const prices = g.map((x) => x.price);
+      const lo = Math.min(...prices), hi = Math.max(...prices);
+      const ok = g.some(sellableToday);
+      const days = daysOf(first);
+      const worst = g.map((x) => x.stock_status).find((s) => s === "out") || g.map((x) => x.stock_status).find(Boolean);
+      return `<button class="item ${ok ? "" : "off"} ${worst === "out" ? "out" : ""}" data-g="${gi}" ${ok ? "" : `title="Only sold on ${esc(days.join(", "))}"`}>
+        <span class="n">${esc(g.length > 1 ? groupName(first) : (grouped ? first.name : first.name))}</span>
+        <span><span class="p">${g.length > 1 && lo !== hi ? "from " : ""}${money(lo)}</span>
+          ${g.length > 1 ? `<div class="small muted">${g.length} options</div>` : ""}
+          ${days.length ? `<div class="small"><span class="tag ${ok ? "ok" : "grey"}">${esc(days.join(", "))} only</span></div>` : ""}
+          ${worst ? `<div class="stk">${stBadge(worst)}</div>` : ""}</span>
+      </button>`;
+    }).join("") || `<div class="empty">No menu items. ${can("catalog.edit") ? "Load the menu in Setup → Import / export." : ""}</div>`;
+    el.querySelectorAll(".item").forEach((b) => b.addEventListener("click", () => {
+      const g = groups[Number(b.dataset.g)];
+      if (g.length === 1) return tryAdd(g[0]);
+      variantModal(g);
+    }));
   };
-  drawItems(items);
+  drawTiles(inCat, true);
   document.getElementById("os")?.addEventListener("click", shiftModal);
+  document.getElementById("counter").onclick = () => { if (S.tab && S.cart.length && !confirm("Items not sent to the kitchen will be cleared. Continue?")) return; S.tab = null; S.cart = []; S.discount = null; viewPOS(el); };
+  document.getElementById("newtab")?.addEventListener("click", () => newTabModal(el));
+  el.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click", () => {
+    if (S.cart.length && !confirm("Items not sent yet will be cleared. Switch check?")) return;
+    S.tab = S.tabs.find((t) => t.id === Number(b.dataset.tab)); S.cart = []; S.discount = null; viewPOS(el);
+  }));
   el.querySelectorAll(".cats button").forEach((b) => b.addEventListener("click", () => { S.cat = b.dataset.c === "all" ? "all" : Number(b.dataset.c); viewPOS(el); }));
   const scan = document.getElementById("scan");
   scan.addEventListener("input", () => {
     const q = scan.value.trim().toLowerCase();
-    drawItems(q ? S.menu.items.filter((i) => i.name.toLowerCase().includes(q) || (i.sku || "").toLowerCase() === q || i.barcode === q) : items);
+    if (!q) return drawTiles(inCat, true);
+    drawTiles(S.menu.items.filter((i) => i.name.toLowerCase().includes(q) || (i.sku || "").toLowerCase() === q || i.barcode === q), false);
   });
   scan.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
@@ -364,27 +432,44 @@ function viewPOS(el) {
     if (!q) return;
     const lq = q.toLowerCase();
     const hit = S.menu.items.find((i) => i.barcode === q) || S.menu.items.find((i) => (i.sku || "").toLowerCase() === lq)
+      || S.menu.items.find((i) => i.name.toLowerCase() === lq)
       || (() => { const m = S.menu.items.filter((i) => i.name.toLowerCase().includes(lq)); return m.length === 1 ? m[0] : null; })();
-    if (hit) { addToCart(hit.id); scan.value = ""; drawItems(items); }
-    else toast(`No single item matches "${q}"`, true);
+    if (hit) { tryAdd(hit); scan.value = ""; drawTiles(inCat, true); }
+    else toast(`No single item matches "${q}" – tap it in the list`, true);
   });
   if (matchMedia("(pointer: fine)").matches) scan.focus();  // keyboard/scanner tills; don't pop the keyboard on tablets
   renderCart();
 }
 
+function variantModal(g) {
+  const first = g[0];
+  const m = modal(`<h2>${esc(groupName(first))}</h2>
+    ${first.description ? `<div class="small muted" style="margin-bottom:10px">${esc(first.description)}</div>` : ""}
+    <div class="vgrid">${g.map((i, k) => `<button class="btn big ${sellableToday(i) ? "" : "off"}" data-v="${k}" ${sellableToday(i) ? "" : "disabled"}>
+      ${esc(variantName(i))}<br><span class="p">${money(i.price)}</span></button>`).join("")}</div>
+    <div class="actions"><button class="btn" id="x">Close</button></div>`);
+  m.querySelector("#x").onclick = closeModal;
+  m.querySelectorAll("[data-v]").forEach((b) => b.addEventListener("click", () => { closeModal(); tryAdd(g[Number(b.dataset.v)]); }));
+}
+
+function tryAdd(item) {
+  if (!sellableToday(item)) return toast(`${item.name} is only sold on ${daysOf(item).join(", ")}.`, true);
+  addToCart(item.id);
+}
+
 const orderTypes = () => (S.state.settings.order_types || "Dine in").split(",").map((x) => x.trim()).filter(Boolean);
 const curOrderType = () => (orderTypes().includes(S.orderType) ? S.orderType : orderTypes()[0]);
 function cartChanged() { S.pending = null; renderCart(); }
-function addToCart(id) {
-  const line = S.cart.find((l) => l.id === id);
+function addToCart(id, note = null) {
+  const line = S.cart.find((l) => l.id === id && (l.note || null) === note);
   if (line) line.qty++;
-  else { const it = S.menu.items.find((i) => i.id === id); S.cart.push({ id, name: it.name, price: it.price, qty: 1 }); }
+  else { const it = S.menu.items.find((i) => i.id === id); S.cart.push({ id, name: it.name, price: it.price, qty: 1, note }); }
   cartChanged();
 }
 
 // Display-only estimate; the server recalculates everything from its own prices.
 function cartTotals() {
-  const sub = S.cart.reduce((s, l) => s + l.price * l.qty, 0);
+  const sub = S.cart.reduce((s, l) => s + l.price * l.qty, 0) + (S.tab ? S.tab.total : 0);
   let disc = 0;
   if (S.discount) disc = S.discount.type === "pct" ? Math.round(sub * S.discount.value) / 100 : Math.min(S.discount.value, sub);
   const net = sub - disc;
@@ -394,49 +479,225 @@ function cartTotals() {
   return { sub, disc, tax: Math.round(tax * 100) / 100, total: Math.round((incl || !rate ? net : net + tax) * 100) / 100, rate, incl };
 }
 
+// Unsent cart lines survive a page reload (e.g. after a frozen till is refreshed). Per till, per staff member, 12 h max.
+function saveDraft() {
+  if (!S.staff) return;
+  store.set("cfc_draft", S.cart.length ? JSON.stringify({ staff: S.staff.id, tab: S.tab?.id || null, at: Date.now(),
+    cart: S.cart.map((l) => ({ id: l.id, qty: l.qty, note: l.note || null })) }) : null);
+}
+function restoreDraft() {
+  if (S.draftChecked || !S.staff) return;
+  S.draftChecked = true;
+  let d; try { d = JSON.parse(store.get("cfc_draft") || "null"); } catch { d = null; }
+  if (!d || d.staff !== S.staff.id || Date.now() - d.at > 12 * 3600 * 1000 || S.cart.length) return;
+  if (d.tab) { const t = S.tabs.find((x) => x.id === d.tab); if (!t) return; S.tab = t; }
+  S.cart = d.cart.map((l) => { const it = S.menu.items.find((i) => i.id === l.id); return it ? { id: l.id, name: it.name, price: it.price, qty: l.qty, note: l.note } : null; }).filter(Boolean);
+  if (S.cart.length) toast("Unsent items from before the reload are back in the cart.");
+}
+
 function renderCart() {
+  saveDraft();
   const el = document.getElementById("cart");
   if (!el) return;
   const t = cartTotals();
+  const tab = S.tab;
+  const live = tab ? tab.lines.filter((l) => !l.removed_at) : [];
+  const count = S.cart.reduce((n, l) => n + l.qty, 0) + live.reduce((n, l) => n + l.qty, 0);
   let bar = document.getElementById("cartbar");
   if (!bar) { bar = document.createElement("button"); bar.id = "cartbar"; bar.className = "cartbar"; document.getElementById("view").appendChild(bar);
-    bar.addEventListener("click", () => el.scrollIntoView({ behavior: "smooth" })); }
-  bar.textContent = S.cart.length ? `View order · ${S.cart.reduce((n, l) => n + l.qty, 0)} items · ${money(t.total)}` : "";
-  bar.hidden = !S.cart.length;
+    bar.addEventListener("click", () => document.getElementById("cart")?.scrollIntoView({ behavior: "smooth" })); }
+  bar.textContent = count ? `${tab ? tab.label + " · " : ""}View order · ${count} item${count === 1 ? "" : "s"} · ${money(t.total)}` : "";
+  bar.hidden = !count;
   const label = S.state.settings.tax_label || "VAT";
+  const canPay = (S.cart.length || live.length) && S.state.day;
   el.innerHTML = `
-    <h3>Current order</h3>
-    <div class="otypes" role="group" aria-label="Order type">${orderTypes().map((t) => `<button data-ot="${esc(t)}" class="${t === curOrderType() ? "active" : ""}">${esc(t)}</button>`).join("")}</div>
+    ${tab ? `<div class="tabhead"><div><h3 style="margin:0">Check: ${esc(tab.label)}</h3>
+        <div class="small muted">${esc(tab.order_type)}${tab.guests ? ` · ${Number(tab.guests)} guests` : ""} · server ${esc(tab.server)} · opened ${esc(tab.opened_at.slice(11, 16))}</div></div>
+        <button class="btn" id="tabmenu">⋯</button></div>`
+      : `<h3>Counter sale</h3>
+         <div class="otypes" role="group" aria-label="Order type">${orderTypes().map((o) => `<button data-ot="${esc(o)}" class="${o === curOrderType() ? "active" : ""}">${esc(o)}</button>`).join("")}</div>`}
     <div class="lines">
+      ${live.map((l) => `<div class="line sent">
+          <div><div><b>${esc(l.name)}</b> ${l.sent_at ? `<span class="tag grey" title="Sent ${esc((l.sent_at || "").slice(11, 16))}">sent</span>` : `<span class="tag warn">not sent</span>`}</div>
+            ${l.note ? `<div class="small">↳ ${esc(l.note)}</div>` : ""}<div class="muted small">${money(l.price)} each</div></div>
+          <div class="qty"><b>${l.qty}</b><button data-rm="${l.id}" aria-label="Remove ${esc(l.name)}" title="Remove">✕</button></div>
+          <div class="num"><b>${money(l.price * l.qty)}</b></div></div>`).join("")}
       ${S.cart.map((l, i) => `
         <div class="line">
-          <div><div><b>${esc(l.name)}</b></div><div class="muted small">${money(l.price)} each</div></div>
+          <div><div><b class="noteable" data-note="${i}" title="Add a note">${esc(l.name)}</b>${tab ? ` <span class="tag ok">new</span>` : ""}</div>
+            <div class="small">${l.note ? `↳ ${esc(l.note)}` : `<a href="#" data-note="${i}" class="muted">+ note</a>`}</div>
+            <div class="muted small">${money(l.price)} each</div></div>
           <div class="qty"><button data-m="${i}" aria-label="One less">−</button><b>${l.qty}</b><button data-p="${i}" aria-label="One more">+</button></div>
           <div class="num"><b>${money(l.price * l.qty)}</b></div>
-        </div>`).join("") || `<div class="empty">Tap or scan items to add them</div>`}
+        </div>`).join("")}
+      ${!live.length && !S.cart.length ? `<div class="empty">Tap or scan items to add them</div>` : ""}
     </div>
     ${t.disc ? `<div class="row small" style="justify-content:space-between;display:flex"><span>Discount (${esc(S.discount.reason || "")})</span><span class="num">−${money(t.disc)}</span></div>` : ""}
-    ${t.rate ? `<div class="row small muted" style="justify-content:space-between;display:flex"><span>${esc(label)} ${t.rate}% ${t.incl ? "(included)" : ""}</span><span class="num">${money(t.tax)}</span></div>` : ""}
+    ${t.rate ? `<div class="row small muted" style="justify-content:space-between;display:flex"><span>${esc(label)} ${t.rate}% ${t.incl ? "(included in prices)" : ""}</span><span class="num">${money(t.tax)}</span></div>` : ""}
     <div class="total"><span>Total</span><span class="num">${money(t.total)}</span></div>
     ${S.pending ? `<div class="note"><b>Last payment didn't get a reply.</b> Retrying is safe — it can't charge twice.
         <button class="btn primary" id="retry">Retry payment</button></div>` : ""}
+    ${tab && S.state.day ? `<div class="row" style="margin-bottom:8px"><button class="btn big primary" id="send" ${S.cart.length || tab.unsent ? "" : "disabled"}>Send to kitchen</button>
+        <label class="shrink small" style="margin:0"><input type="checkbox" id="pt" style="width:auto;min-height:0" ${printTickets() ? "checked" : ""}> print ticket</label></div>` : ""}
     ${S.state.day ? `
       <div class="paybtns">
-        <button class="btn big ok" data-pay="cash" ${S.cart.length ? "" : "disabled"}>Cash</button>
-        <button class="btn big ok" data-pay="mpesa" ${S.cart.length ? "" : "disabled"}>M-Pesa</button>
-        <button class="btn big ok" data-pay="card" ${S.cart.length ? "" : "disabled"}>Card</button>
+        <button class="btn big ok" data-pay="cash" ${canPay ? "" : "disabled"}>Cash</button>
+        <button class="btn big ok" data-pay="mpesa" ${canPay ? "" : "disabled"}>M-Pesa</button>
+        <button class="btn big ok" data-pay="card" ${canPay ? "" : "disabled"}>Card</button>
       </div>` : `<div class="note">Open the day to start selling.</div>`}
-    ${S.cart.length ? `<div class="row" style="margin-top:8px"><button class="btn" id="disc">${S.discount ? "Change discount" : "Discount"}</button>
-       <button class="btn danger" id="clear">Clear order</button></div>` : ""}`;
+    ${S.cart.length || live.length ? `<div class="row" style="margin-top:8px"><button class="btn" id="disc">${S.discount ? "Change discount" : "Discount"}</button>
+       ${S.cart.length ? `<button class="btn danger" id="clear">${tab ? "Clear new items" : "Clear order"}</button>` : ""}
+       ${!tab && S.cart.length && S.state.day ? `<button class="btn" id="hold" title="Keep this order open and pay later">Hold as check</button>` : ""}</div>` : ""}`;
   el.querySelectorAll("[data-p]").forEach((b) => b.addEventListener("click", () => { S.cart[b.dataset.p].qty++; cartChanged(); }));
   el.querySelectorAll("[data-m]").forEach((b) => b.addEventListener("click", () => {
     const l = S.cart[b.dataset.m]; l.qty--; if (l.qty <= 0) S.cart.splice(b.dataset.m, 1); cartChanged();
   }));
+  el.querySelectorAll("[data-note]").forEach((b) => b.addEventListener("click", (e) => { e.preventDefault(); noteModal(Number(b.dataset.note)); }));
+  el.querySelectorAll("[data-rm]").forEach((b) => b.addEventListener("click", () => removeLineModal(tab.lines.find((l) => l.id === Number(b.dataset.rm)))));
   el.querySelectorAll("[data-pay]").forEach((b) => b.addEventListener("click", () => payModal(b.dataset.pay)));
   el.querySelectorAll("[data-ot]").forEach((b) => b.addEventListener("click", () => { S.orderType = b.dataset.ot; cartChanged(); }));
-  document.getElementById("clear")?.addEventListener("click", () => { S.cart = []; S.discount = null; S.orderType = null; cartChanged(); });
+  document.getElementById("clear")?.addEventListener("click", () => { S.cart = []; S.discount = null; if (!tab) S.orderType = null; cartChanged(); });
   document.getElementById("disc")?.addEventListener("click", discountModal);
-  document.getElementById("retry")?.addEventListener("click", () => submitOrder(S.pending.body));
+  document.getElementById("retry")?.addEventListener("click", () => submitOrder(S.pending.body, null, S.pending.path));
+  document.getElementById("send")?.addEventListener("click", (e) => sendToKitchen(e.target));
+  document.getElementById("pt")?.addEventListener("change", (e) => store.set("cfc_print_ticket", e.target.checked ? "1" : "0"));
+  document.getElementById("tabmenu")?.addEventListener("click", tabMenu);
+  document.getElementById("hold")?.addEventListener("click", () => newTabModal(document.getElementById("view"), true));
+}
+
+function noteModal(i) {
+  const l = S.cart[i];
+  const quick = ["No onions", "Extra spicy", "Not spicy", "Well done", "Pack to go", "Fries", "Pilau rice", "White rice", "Chapati", "Ugali"];
+  const m = modal(`<h2>Note for ${esc(l.name)}</h2>
+    <div class="quick">${quick.map((q) => `<button class="btn" data-q="${esc(q)}">${esc(q)}</button>`).join("")}</div>
+    <label>Note (printed on the kitchen ticket and receipt)</label><input id="nt" maxlength="120" value="${esc(l.note || "")}" autofocus>
+    <div class="actions"><button class="btn" id="x">Cancel</button><button class="btn primary" id="ok">Save note</button></div>`);
+  const inp = m.querySelector("#nt");
+  m.querySelectorAll("[data-q]").forEach((b) => b.addEventListener("click", () => { inp.value = inp.value ? `${inp.value}, ${b.dataset.q}` : b.dataset.q; }));
+  m.querySelector("#x").onclick = closeModal;
+  const save = () => {
+    const note = inp.value.trim() || null;
+    if (l.qty > 1 && note !== (l.note || null)) { l.qty--; S.cart.splice(i + 1, 0, { ...l, qty: 1, note }); }  // note applies to one plate
+    else l.note = note;
+    closeModal(); cartChanged();
+  };
+  m.querySelector("#ok").onclick = save;
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+}
+
+function newTabModal(el, holdCurrent = false) {
+  const m = modal(`<h2>${holdCurrent ? "Hold order as a check" : "New check"}</h2>
+    <label>Table number or name</label><input id="tl" maxlength="30" autofocus placeholder="e.g. T5, Bar 2, Mr Otieno">
+    <label>Order type</label><div class="otypes" id="tot">${orderTypes().map((o, k) => `<button data-o="${esc(o)}" class="${(holdCurrent ? o === curOrderType() : k === 0) ? "active" : ""}">${esc(o)}</button>`).join("")}</div>
+    <label>Guests (optional)</label><input id="tg" type="number" min="0" max="500" inputmode="numeric" style="max-width:140px">
+    <div class="err" id="terr"></div>
+    <div class="actions"><button class="btn" id="x">Cancel</button><button class="btn primary" id="ok">${holdCurrent ? "Hold & send to kitchen" : "Open check"}</button></div>`);
+  let type = holdCurrent ? curOrderType() : orderTypes()[0];
+  m.querySelectorAll("[data-o]").forEach((b) => b.addEventListener("click", () => { type = b.dataset.o; m.querySelectorAll("[data-o]").forEach((x) => x.classList.toggle("active", x === b)); }));
+  m.querySelector("#x").onclick = closeModal;
+  const key = uuid();
+  const go = async () => {
+    try {
+      const t = await api("/api/tabs", { method: "POST", json: { label: m.querySelector("#tl").value, order_type: type,
+        guests: m.querySelector("#tg").value === "" ? null : Number(m.querySelector("#tg").value), client_ref: key } });
+      closeModal(); S.tab = t;
+      if (holdCurrent && S.cart.length) { await sendToKitchen(null); return; }
+      S.cart = []; viewPOS(el);
+    } catch (e) { m.querySelector("#terr").textContent = e.message; }
+  };
+  m.querySelector("#ok").onclick = go;
+  m.querySelector("#tl").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+}
+
+let sending = false;
+async function sendToKitchen(btn) {
+  if (sending || !S.tab) return;
+  sending = true;
+  if (btn) btn.disabled = true;
+  const batch = S.sendBatch || (S.sendBatch = uuid());  // retry-safe: same batch never adds items twice
+  try {
+    let res;
+    if (S.cart.length) {
+      res = await api(`/api/tabs/${S.tab.id}/items`, { method: "POST", json: { items: S.cart.map((l) => ({ menu_item_id: l.id, qty: l.qty, note: l.note })), send: true, batch_ref: batch } });
+    } else {
+      res = await api(`/api/tabs/${S.tab.id}/send`, { method: "POST" });
+    }
+    S.sendBatch = null; S.cart = [];
+    const ids = new Set(res.added_line_ids || []);
+    S.tab = res;
+    if (printTickets() && ids.size) printHTML(ticketHTML(res, res.lines.filter((l) => ids.has(l.id))), true);
+    toast(`Sent to kitchen: ${res.label}`);
+    viewPOS(document.getElementById("view"));
+  } catch (e) {
+    fail(e);
+    if (!(e instanceof NetError)) S.sendBatch = null;
+    if (btn) btn.disabled = false;
+  } finally { sending = false; }
+}
+
+function ticketHTML(tab, lines) {
+  return `<div class="receipt"><div class="c"><b style="font-size:16px">KITCHEN · ${esc(tab.label)}</b><br>${esc(tab.order_type)}${tab.guests ? ` · ${Number(tab.guests)} guests` : ""}</div><hr>
+    <div class="r"><span>${esc(new Date().toTimeString().slice(0, 5))}</span><span>Server: ${esc(tab.server)}</span></div><hr>
+    ${lines.map((l) => `<div style="font-size:15px"><b>${l.qty} × ${esc(l.name)}</b></div>${l.note ? `<div>&nbsp;&nbsp;↳ ${esc(l.note)}</div>` : ""}`).join("")}
+    <hr><div class="c small">${lines.length} line(s)</div></div>`;
+}
+
+function tabMenu() {
+  const t = S.tab;
+  const m = modal(`<h2>Check ${esc(t.label)}</h2>
+    <div class="actions" style="justify-content:flex-start">
+      <button class="btn" id="rp">Reprint kitchen ticket (all items)</button>
+      <button class="btn" id="bill">Print bill (pro-forma)</button>
+      <button class="btn danger" id="cx">Cancel check…</button>
+      <button class="btn" id="x">Close</button></div>`);
+  const live = t.lines.filter((l) => !l.removed_at);
+  m.querySelector("#x").onclick = closeModal;
+  m.querySelector("#rp").onclick = () => { closeModal(); printHTML(ticketHTML(t, live), true); };
+  m.querySelector("#bill").onclick = () => { closeModal(); printHTML(billHTML(t, live), true); };
+  m.querySelector("#cx").onclick = () => {
+    const sent = live.some((l) => l.sent_at);
+    const m2 = modal(`<h2>Cancel check ${esc(t.label)}</h2>
+      ${sent ? `<div class="note">Items were already sent to the kitchen. A reason is required${isManager() ? "" : " and a manager must approve"}. It will show in the Voids report.</div>` : ""}
+      <label>Reason</label><input id="cr" maxlength="200" autofocus>
+      ${sent && !isManager() ? `<label>Manager PIN</label><input id="cp" type="password" inputmode="numeric" maxlength="6">` : ""}
+      <div class="err" id="cerr"></div>
+      <div class="actions"><button class="btn" id="x2">Back</button><button class="btn danger" id="ok2">Cancel check</button></div>`);
+    m2.querySelector("#x2").onclick = closeModal;
+    m2.querySelector("#ok2").onclick = async () => {
+      try {
+        await api(`/api/tabs/${t.id}/cancel`, { method: "POST", json: { reason: m2.querySelector("#cr").value, approver_pin: m2.querySelector("#cp")?.value || null } });
+        closeModal(); S.tab = null; S.cart = []; toast("Check cancelled"); viewPOS(document.getElementById("view"));
+      } catch (e) { m2.querySelector("#cerr").textContent = e.message; }
+    };
+  };
+}
+
+function billHTML(t, lines) {
+  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+  const L = (a, b) => `<div class="r"><span>${a}</span><span>${b}</span></div>`;
+  return `<div class="receipt"><div class="c"><b style="font-size:15px">${esc(S.state.business_name)}</b><br>BILL – NOT A RECEIPT</div><hr>
+    ${L("Check " + esc(t.label), esc(t.order_type))}${L(esc(new Date().toTimeString().slice(0, 5)), "Server " + esc(t.server))}<hr>
+    ${lines.map((l) => L(`${l.qty} × ${esc(l.name)}`, Number(l.price * l.qty).toLocaleString())).join("")}<hr>
+    ${L("<b>TO PAY</b>", "<b>" + money(total) + "</b>")}
+    ${Number(S.state.settings.tax_rate_pct) > 0 && S.state.settings.tax_inclusive === "1" ? `<div class="c small">Prices include ${esc(S.state.settings.tax_label)} ${esc(S.state.settings.tax_rate_pct)}%</div>` : ""}
+    <hr><div class="c small">Pay by cash, M-Pesa or card</div></div>`;
+}
+
+function removeLineModal(l) {
+  const sent = !!l.sent_at;
+  const m = modal(`<h2>Remove ${l.qty} × ${esc(l.name)}</h2>
+    ${sent ? `<div class="note">Already sent to the kitchen: a reason is required${isManager() ? "" : " and a manager must approve"}. This shows in the Voids report.</div>` : ""}
+    <label>Reason ${sent ? "" : "(optional)"}</label><input id="rr" maxlength="200" autofocus placeholder="e.g. customer changed mind, wrong item">
+    ${sent && !isManager() ? `<label>Manager PIN</label><input id="rp" type="password" inputmode="numeric" maxlength="6">` : ""}
+    <div class="err" id="rerr"></div>
+    <div class="actions"><button class="btn" id="x">Back</button><button class="btn danger" id="ok">Remove item</button></div>`);
+  m.querySelector("#x").onclick = closeModal;
+  m.querySelector("#ok").onclick = async () => {
+    try {
+      S.tab = await api(`/api/tab-lines/${l.id}/remove`, { method: "POST", json: { reason: m.querySelector("#rr").value || null, approver_pin: m.querySelector("#rp")?.value || null } });
+      closeModal(); toast("Item removed"); viewPOS(document.getElementById("view"));
+    } catch (e) { m.querySelector("#rerr").textContent = e.message; }
+  };
 }
 
 function discountModal() {
@@ -465,8 +726,12 @@ function needsApproval() {
   return t.sub > 0 && (t.disc / t.sub) * 100 > Number(S.state.settings.cashier_max_discount_pct || 0) + 1e-9;
 }
 
-function payModal(method) {
+async function payModal(method) {
   if (S.state.settings.require_shift === "1" && !S.state.shift) return shiftModal();
+  if (S.tab && S.cart.length) {  // everything on a check is sent before it is paid
+    await sendToKitchen(null);
+    if (S.cart.length || !S.tab) return;
+  }
   const total = cartTotals().total;
   const quick = [...new Set([total, Math.ceil(total / 100) * 100, Math.ceil(total / 500) * 500, Math.ceil(total / 1000) * 1000])];
   const body = {
@@ -480,9 +745,9 @@ function payModal(method) {
            <label>Card slip / approval no. (optional)</label><input id="ref" maxlength="40" autofocus>`,
   }[method];
   const m = modal(`
-    <h2>${{ cash: "Cash", mpesa: "M-Pesa", card: "Card" }[method]} payment · ${money(total)}</h2>
+    <h2>${{ cash: "Cash", mpesa: "M-Pesa", card: "Card" }[method]} payment · ${money(total)}${S.tab ? ` · ${esc(S.tab.label)}` : ""}</h2>
     ${body}
-    ${S.state.settings.ask_guests === "1" ? `<label>Guests (covers)</label><input id="gst" type="number" min="0" max="500" step="1" inputmode="numeric" placeholder="optional" style="max-width:140px">` : ""}
+    ${S.state.settings.ask_guests === "1" && !(S.tab && S.tab.guests) ? `<label>Guests (covers)</label><input id="gst" type="number" min="0" max="500" step="1" inputmode="numeric" placeholder="optional" style="max-width:140px">` : ""}
     ${needsApproval() ? `<label>Manager PIN to approve the discount</label><input id="apin" type="password" inputmode="numeric" maxlength="6">` : ""}
     <div class="err" id="perr"></div>
     <div class="actions"><button class="btn" id="cancel">Cancel</button><button class="btn primary big" id="confirm">Confirm payment</button></div>`);
@@ -492,37 +757,36 @@ function payModal(method) {
   m.querySelectorAll("[data-q]").forEach((b) => b.addEventListener("click", () => { tend.value = b.dataset.q; upd(); }));
   m.querySelector("#cancel").onclick = closeModal;
   const confirm = () => {
-    if (S.pending) return submitOrder(S.pending.body, m);  // never create a second key for the same cart
-    const body = {
-      items: S.cart.map((l) => ({ menu_item_id: l.id, qty: l.qty })),
+    if (S.pending) return submitOrder(S.pending.body, m, S.pending.path);  // never create a second key for the same sale
+    const common = {
       payment_method: method,
       amount_tendered: method === "cash" ? Number(tend.value || 0) : null,
       payment_ref: m.querySelector("#ref")?.value || null,
       discount: S.discount, approver_pin: m.querySelector("#apin")?.value || null,
-      client_ref: uuid(), order_type: curOrderType(),
+      client_ref: uuid(),
       guests: m.querySelector("#gst")?.value ? Number(m.querySelector("#gst").value) : null,
     };
-    submitOrder(body, m);
+    if (S.tab) return submitOrder(common, m, `/api/tabs/${S.tab.id}/pay`);
+    submitOrder({ ...common, items: S.cart.map((l) => ({ menu_item_id: l.id, qty: l.qty, note: l.note })), order_type: curOrderType() }, m, "/api/orders");
   };
   m.querySelector("#confirm").onclick = confirm;
   m.querySelectorAll("input").forEach((i) => i.addEventListener("keydown", (e) => { if (e.key === "Enter") confirm(); }));
 }
 
 let submitting = false;
-async function submitOrder(body, m) {
+async function submitOrder(body, m, path = "/api/orders") {
   if (submitting) return;
   submitting = true;
   const btn = m?.querySelector("#confirm");
   if (btn) btn.disabled = true;
   try {
-    const order = await api("/api/orders", { method: "POST", json: body, timeout: 15000 });
-    S.cart = []; S.discount = null; S.pending = null; S.orderType = null;  // next check starts on the default order type
-    renderCart();
+    const order = await api(path, { method: "POST", json: body, timeout: 15000 });
+    S.cart = []; S.discount = null; S.pending = null; S.orderType = null; S.tab = null;  // next sale starts fresh
     receiptModal(order);
-    refreshState().then(() => { if (S.view === "pos") document.querySelector("#shiftbtn") && (document.querySelector("#shiftbtn").textContent = "Shift ✓"); }).catch(() => {});
+    refreshState().then(() => { if (S.view === "pos") viewPOS(document.getElementById("view")); }).catch(() => {});
   } catch (e) {
     if (e instanceof NetError) {
-      S.pending = { body };  // same client_ref on retry -> server returns the original sale if it went through
+      S.pending = { body, path };  // same client_ref on retry -> server returns the original sale if it went through
       closeModal(); renderCart();
       toast("No reply from the server. Press 'Retry payment' when the connection is back — it can't charge twice.", true);
     } else {
@@ -539,14 +803,15 @@ function receiptHTML(o) {
   const s = S.state.settings;
   return `<div class="receipt">
     <div class="c"><b style="font-size:15px">${esc(S.state.business_name)}</b><br>${esc(o.business_address || s.business_address || "")}
-      ${o.business_pin ? `<br>PIN: ${esc(o.business_pin)}` : ""}</div><hr>
+      ${o.business_phone ? `<br>Tel ${esc(o.business_phone)}` : ""}${o.business_pin ? `<br>PIN: ${esc(o.business_pin)}` : ""}</div><hr>
     ${L("Receipt #" + o.number, esc(o.business_date))}
+    ${o.tab_label ? L("Check " + esc(o.tab_label), o.server ? "Server " + esc(o.server) : "") : ""}
     ${o.order_type ? L(esc(o.order_type), o.guests ? `${Number(o.guests)} guest(s)` : "") : ""}
-    ${L(esc((o.created_at || "").slice(11, 16)), "Served by " + esc(o.cashier))}<hr>
-    ${o.items.map((i) => L(`${i.qty} × ${esc(i.name)}`, Number(i.price * i.qty).toLocaleString())).join("")}<hr>
+    ${L(esc((o.created_at || "").slice(11, 16)), "Cashier " + esc(o.cashier))}<hr>
+    ${o.items.map((i) => L(`${i.qty} × ${esc(i.name)}`, Number(i.price * i.qty).toLocaleString()) + (i.note ? `<div class="small">&nbsp;&nbsp;↳ ${esc(i.note)}</div>` : "")).join("")}<hr>
     ${o.discount ? L("Subtotal", money(o.subtotal)) + L("Discount", "−" + money(o.discount)) : ""}
-    ${o.tax ? L(`${esc(o.tax_label || "VAT")} ${o.tax_rate}%${o.tax_inclusive ? " incl." : ""}`, money(o.tax)) : ""}
     ${L("<b>TOTAL</b>", "<b>" + money(o.total) + "</b>")}
+    ${o.tax ? L(`incl. ${esc(o.tax_label || "VAT")} ${o.tax_rate}%`, money(o.tax)) : ""}
     ${L("Paid by", { cash: "Cash", mpesa: "M-Pesa", card: "Card" }[o.payment_method])}
     ${o.payment_method === "cash" ? L("Cash", money(o.amount_tendered)) + L("Change", money(o.change)) : ""}
     ${o.payment_ref ? L("Ref", esc(o.payment_ref)) : ""}
@@ -1287,15 +1552,23 @@ async function setupMenu(sv) {
   const [items, ings] = await Promise.all([api("/api/menu-items"), api("/api/ingredients")]);
   sv.innerHTML = `<div class="panel">
     <div class="row" style="margin-bottom:10px"><h2 style="margin:0">Menu & recipes</h2><div class="shrink"><button class="btn primary" id="add">+ Add menu item</button></div></div>
-    <div class="small muted" style="margin-bottom:10px">Food cost uses ingredient costs (purchase cost, not selling price). Food cost % = cost of one plate ÷ selling price.</div>
+    <div class="small muted" style="margin-bottom:10px">Prices are what the customer pays${Number(S.state.settings.tax_rate_pct) > 0 && S.state.settings.tax_inclusive === "1" ? `, VAT ${esc(S.state.settings.tax_rate_pct)}% included` : ""}. Food cost uses ingredient purchase costs. Food cost % = cost of one plate ÷ selling price.</div>
+    ${items.some((i) => i.flag) ? `<div class="note"><b>${items.filter((i) => i.flag).length} item(s) need a decision</b> (marked “review”). Open each one, check the price, and Save to clear the mark.</div>` : ""}
+    <div class="row" style="max-width:720px;margin-bottom:8px"><div><input id="mq" placeholder="Search menu…" value="${esc(S.menuQ || "")}"></div>
+      <div><select id="mcf"><option value="">All categories</option>${[...new Set(items.map((i) => i.category || ""))].map((c) => `<option ${S.menuCat === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></div>
+      <div class="shrink"><label style="margin:0"><input type="checkbox" id="mfl" style="width:auto;min-height:0" ${S.menuFlag ? "checked" : ""}> review only</label></div></div>
     <div class="tablewrap"><table><thead><tr><th>Item</th><th>Category</th><th>SKU / barcode</th><th class="num">Price</th><th>Recipe (per plate)</th><th class="num">Food cost</th><th class="num">%</th><th></th></tr></thead><tbody>
-    ${items.map((i) => {
+    ${items.filter((i) => (!S.menuQ || i.name.toLowerCase().includes(S.menuQ.toLowerCase())) && (!S.menuCat || (i.category || "") === S.menuCat) && (!S.menuFlag || i.flag)).map((i) => {
       const pc = i.price ? (i.food_cost / i.price) * 100 : 0;
-      return `<tr class="${i.active ? "" : "void"}"><td><b>${esc(i.name)}</b></td><td>${esc(i.category || "")}</td><td class="small">${esc([i.sku, i.barcode].filter(Boolean).join(" · "))}</td><td class="num">${money(i.price)}</td>
+      return `<tr class="${i.active ? "" : "void"}"><td><b>${esc(i.name)}</b>${i.flag ? ` <span class="tag bad" title="${esc(i.flag)}">review</span><div class="small" style="color:var(--bad)">${esc(i.flag)}</div>` : ""}${i.available_days ? ` <span class="tag grey">${esc(i.available_days)} only</span>` : ""}</td><td>${esc(i.category || "")}</td><td class="small">${esc([i.sku, i.barcode].filter(Boolean).join(" · "))}</td><td class="num">${money(i.price)}</td>
         <td class="small">${i.recipe.length ? i.recipe.map((r) => `${esc(r.name)} ${r.qty}${r.unit}`).join(", ") : `<span class="tag warn">no recipe</span>`}</td>
         <td class="num">${money(i.food_cost)}</td><td class="num"><span class="tag ${pc > 40 ? "bad" : pc > 32 ? "warn" : "ok"}">${pc.toFixed(0)}%</span></td>
         <td><button class="btn" data-e="${i.id}">Edit</button></td></tr>`;
     }).join("")}</tbody></table></div></div>`;
+  const rerender = () => setupMenu(sv);
+  sv.querySelector("#mq").addEventListener("change", (e) => { S.menuQ = e.target.value; rerender(); });
+  sv.querySelector("#mcf").addEventListener("change", (e) => { S.menuCat = e.target.value; rerender(); });
+  sv.querySelector("#mfl").addEventListener("change", (e) => { S.menuFlag = e.target.checked; rerender(); });
   const edit = (item) => {
     const it = item || { name: "", category: "", price: "", active: 1, recipe: [], sku: "", barcode: "" };
     let lines = it.recipe.map((r) => ({ ingredient_id: r.ingredient_id, qty: r.qty }));
@@ -1307,6 +1580,11 @@ async function setupMenu(sv) {
         <div><label>Status</label><select id="ma"><option value="1">On menu</option><option value="0" ${it.active ? "" : "selected"}>Hidden</option></select></div></div>
       <div class="row"><div><label>SKU (optional, unique)</label><input id="ms" value="${esc(it.sku || "")}" maxlength="40"></div>
         <div><label>Barcode (optional – scan it here)</label><input id="mb" value="${esc(it.barcode || "")}" maxlength="40"></div></div>
+      <div class="row"><div><label>Option group (one POS tile, e.g. "Shawarma")</label><input id="mvg" value="${esc(it.variant_group || "")}" maxlength="60"></div>
+        <div><label>Option (e.g. "Beef", "Large")</label><input id="mvv" value="${esc(it.variant || "")}" maxlength="40"></div>
+        <div><label>Sold only on (e.g. Thu)</label><input id="mdays" value="${esc(it.available_days || "")}" maxlength="40" placeholder="every day"></div></div>
+      <label>Description (shown to servers)</label><input id="mdesc" value="${esc(it.description || "")}" maxlength="300">
+      ${it.flag ? `<div class="note">Review: ${esc(it.flag)}<br>Saving this item marks it as reviewed.</div>` : ""}
       <h3 style="margin-top:16px">Recipe – raw quantity for ONE plate</h3>
       <div class="small muted">Use raw weights (before cooking), so cooking loss is included. Resale items (a soda) use 1 pcs of the stock item.</div>
       <div id="rl"></div><button class="btn" id="addl" style="margin-top:8px">+ Ingredient</button>
@@ -1331,6 +1609,8 @@ async function setupMenu(sv) {
     m.querySelector("#s").onclick = async () => {
       const body = { name: m.querySelector("#mn").value, category: m.querySelector("#mc").value, price: Number(m.querySelector("#mp").value),
         active: m.querySelector("#ma").value === "1", sku: m.querySelector("#ms").value || null, barcode: m.querySelector("#mb").value || null,
+        variant_group: m.querySelector("#mvg").value || null, variant: m.querySelector("#mvv").value || null,
+        available_days: m.querySelector("#mdays").value || null, description: m.querySelector("#mdesc").value || null,
         recipe: lines.map((l) => ({ ingredient_id: l.ingredient_id, qty: Number(l.qty) })) };
       try {
         await api(item ? `/api/menu-items/${item.id}` : "/api/menu-items", { method: item ? "PUT" : "POST", json: body });
@@ -1386,7 +1666,15 @@ async function setupIngredients(sv) {
 }
 
 async function setupExcel(sv) {
-  sv.innerHTML = `<div class="panel"><h2>Menu, recipes & items (Excel / CSV)</h2>
+  sv.innerHTML = `<div class="panel"><h2>Menu catalogue (CSV)</h2>
+    <p class="small">The full menu as sold on the POS: category, major group, name, option, price (what the customer pays), description, sale days.
+      The City Food Court menu is in <code>menus/cfc_menu.csv</code>. Re-importing the same file changes nothing; price changes are logged.</p>
+    <div class="row" style="max-width:760px"><div><input type="file" id="mf" accept=".csv"></div>
+      <div class="shrink"><label style="margin:0"><input type="checkbox" id="mh" style="width:auto;min-height:0"> hide items not in the file</label></div>
+      <div class="shrink"><button class="btn" id="mpv">Check file</button></div><div class="shrink"><button class="btn primary" id="mup" disabled>Import menu</button></div>
+      ${can("data.export") ? `<div class="shrink"><button class="btn" id="mdl">Download current menu</button></div>` : ""}</div>
+    <div class="err" id="merr2"></div><div id="mok"></div></div>
+    <div class="panel"><h2>Menu, recipes & items (Excel / CSV)</h2>
     <p>Download the file first: it contains everything currently in the system (or examples if empty) and a <b>How to fill</b> sheet.
        A CSV with the Ingredients columns also works for stock items.</p>
     <div class="row" style="max-width:640px"><div class="shrink"><button class="btn" id="dl">Download Excel</button></div>
@@ -1403,6 +1691,27 @@ async function setupExcel(sv) {
         <div class="shrink"><button class="btn" id="wa">Analyse workbook</button></div></div>
       <div class="err" id="werr"></div><div id="wout"></div></div>`;
   document.getElementById("dl").onclick = () => download("/api/excel", "cfc-recipes.xlsx");
+  document.getElementById("mdl")?.addEventListener("click", () => download("/api/export/menu.csv", "menu.csv"));
+  const sendMenu = async (preview) => {
+    const f = document.getElementById("mf").files[0];
+    document.getElementById("merr2").textContent = ""; document.getElementById("mok").innerHTML = "";
+    if (!f) return (document.getElementById("merr2").textContent = "Choose the menu CSV first.");
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await api(`/api/import/menu?preview=${preview}&hide_missing=${document.getElementById("mh").checked}`, { method: "POST", body: fd });
+      document.getElementById("mok").innerHTML = `<div class="info" style="margin-top:10px">${preview ? "File is OK. It would load" : "Menu imported ✓"}
+        ${r.rows} items in ${r.categories} categories: ${r.created} new, ${r.updated} updated, ${r.unchanged} unchanged.
+        ${r.price_changes.length ? `<br><b>Price changes:</b> ${r.price_changes.map((p) => esc(`${p.item} ${p.old} → ${p.new}`)).join("; ")}` : ""}
+        ${r.hidden_missing.length ? `<br><b>Hidden (not in file):</b> ${r.hidden_missing.map(esc).join(", ")}` : ""}
+        ${r.hidden_items.length ? `<br><b>Hidden until priced:</b> ${r.hidden_items.map(esc).join(", ")}` : ""}
+        ${r.flags.length ? `<br><b>To review:</b><br>${r.flags.map(esc).join("<br>")}` : ""}</div>`;
+      document.getElementById("mup").disabled = !preview;
+      if (!preview) await loadMenu();
+    } catch (e) { document.getElementById("merr2").textContent = e.message; document.getElementById("mup").disabled = true; }
+  };
+  document.getElementById("mf").onchange = () => { document.getElementById("mup").disabled = true; };
+  document.getElementById("mpv").onclick = () => sendMenu(true);
+  document.getElementById("mup").onclick = () => sendMenu(false);
   document.getElementById("dls")?.addEventListener("click", () => download("/api/export/stock.csv", "stock.csv"));
   const send = async (preview) => {
     const f = document.getElementById("f").files[0];
@@ -1483,7 +1792,7 @@ async function setupStaff(sv) {
       <b>Manager</b>: everything above plus open/close day, voids, refunds, discounts, adjustments, menu & prices, reports, imports. <b>Admin</b>: also staff, settings, audit log, licence.
       New or reset PINs must be changed by the person at their next login.</div>
     <table><thead><tr><th>Name</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>
-    ${staff.map((s) => `<tr class="${s.active ? "" : "void"}"><td>${esc(s.name)}</td><td>${esc(ROLE[s.role] || s.role)}</td><td>${s.active ? "active" : "disabled"}${s.must_change_pin ? ` <span class="tag warn">PIN change pending</span>` : ""}</td><td><button class="btn" data-e="${s.id}">Edit</button></td></tr>`).join("")}
+    ${staff.map((s) => `<tr class="${s.active ? "" : "void"}"><td>${esc(s.name)}${s.email ? `<div class="muted small">${esc(s.email)}</div>` : ""}</td><td>${esc(ROLE[s.role] || s.role)}</td><td>${s.active ? "active" : "disabled"}${s.must_change_pin ? ` <span class="tag warn">PIN change pending</span>` : ""}</td><td><button class="btn" data-e="${s.id}">Edit</button></td></tr>`).join("")}
     </tbody></table></div>`;
   const edit = (st) => {
     const s = st || { name: "", role: "cashier", active: 1 };
@@ -1492,11 +1801,13 @@ async function setupStaff(sv) {
       <label>${st ? "Reset PIN (leave blank to keep)" : "Temporary PIN (4–6 digits)"}</label><input id="p" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password">
       <div class="row"><div><label>Role</label><select id="r">${Object.entries(ROLE).map(([k, v]) => `<option value="${k}" ${s.role === k ? "selected" : ""}>${v}</option>`).join("")}</select></div>
         <div><label>Status</label><select id="a"><option value="1">Active</option><option value="0" ${s.active ? "" : "selected"}>Disabled</option></select></div></div>
+      <label>Website login e-mail (optional)</label><input id="em" type="email" maxlength="120" value="${esc(s.email || "")}" placeholder="for the website dashboard">
       <div class="err" id="serr"></div>
       <div class="actions"><button class="btn" id="x">Cancel</button><button class="btn primary" id="s">Save</button></div>`);
     m.querySelector("#x").onclick = closeModal;
     m.querySelector("#s").onclick = async () => {
-      const body = { name: m.querySelector("#n").value, pin: m.querySelector("#p").value, role: m.querySelector("#r").value, active: m.querySelector("#a").value === "1" };
+      const body = { name: m.querySelector("#n").value, pin: m.querySelector("#p").value, role: m.querySelector("#r").value, active: m.querySelector("#a").value === "1",
+        email: m.querySelector("#em").value.trim() };
       try { await api(st ? `/api/staff/${st.id}` : "/api/staff", { method: st ? "PUT" : "POST", json: body }); closeModal(); toast("Saved"); setupStaff(sv); }
       catch (e) { m.querySelector("#serr").textContent = e.message; }
     };
@@ -1511,6 +1822,7 @@ async function setupSettings(sv) {
   sv.innerHTML = `<div class="panel" style="max-width:760px"><h2>Settings</h2>
     <h3>Business & receipts</h3>
     <div class="row"><div><label>Business name</label><input id="bn" value="${esc(s.business_name)}" maxlength="80"></div><div><label>Address / town</label><input id="ba" value="${esc(s.business_address)}" maxlength="120"></div></div>
+    <div class="row"><div><label>Phone on receipts</label><input id="bph" value="${esc(s.business_phone || "")}" maxlength="30"></div></div>
     <div class="row"><div><label>KRA PIN on receipts (optional)</label><input id="bp" value="${esc(s.business_pin)}" maxlength="20"></div><div><label>Receipt footer</label><input id="rf" value="${esc(s.receipt_footer)}" maxlength="200"></div></div>
     <h3 style="margin-top:16px">Tax</h3>
     <div class="note">Set this only after confirming the business's VAT position with its accountant. These receipts are not KRA eTIMS fiscal receipts.</div>
@@ -1536,7 +1848,7 @@ async function setupSettings(sv) {
     const v = (id) => document.getElementById(id).value;
     try {
       await api("/api/settings", { method: "PUT", json: {
-        business_name: v("bn"), business_address: v("ba"), business_pin: v("bp"), receipt_footer: v("rf"),
+        business_name: v("bn"), business_address: v("ba"), business_pin: v("bp"), receipt_footer: v("rf"), business_phone: v("bph"),
         variance_tolerance_pct: Number(v("tp")), tax_rate_pct: Number(v("tr") || 0), tax_inclusive: v("ti") === "1", tax_label: v("tl") || "VAT",
         cashier_max_discount_pct: Number(v("md") || 0), critical_pct_of_reorder: Number(v("cp") || 0), reorder_cover_days: Number(v("rc") || 0),
         cost_method: v("cm"), require_shift: v("rs") === "1", session_idle_minutes: Number(v("si") || 720),

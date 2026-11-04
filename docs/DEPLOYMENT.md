@@ -16,13 +16,15 @@ A desktop wrapper would only add value for direct USB receipt printing or a cash
 ## Server install (Windows)
 
 1. Install Python 3.10+ from python.org (tick **Add python.exe to PATH**).
-2. Copy the project folder (e.g. `C:\CFC\inv-pos`). Double-click `setup.bat` once.
-3. Double-click `run.bat`. Allow Python through Windows Firewall on **Private** networks when asked.
-4. Give the server a **fixed IP** (router DHCP reservation), plug it into a **UPS**, disable sleep.
-5. Start automatically: Task Scheduler → *At log on* → run `run.bat`.
-6. Nightly backup: Task Scheduler → daily 23:30 → `.venv\Scripts\python.exe scripts\backup.py`.
-   End-of-day report pack (like a MICROS autosequence): daily 23:45 → `.venv\Scripts\python.exe scripts\eod_reports.py` (files the last closed day's reports in `data\reports\<date>\`).
-7. First login with PIN 1234 → you must choose a new admin PIN.
+2. Copy the project folder (e.g. `C:\CFC\inv-pos`). Double-click `setup.bat` once (it offers to load the CFC menu).
+3. Give the server a **fixed IP** (router DHCP reservation), plug it into a **UPS**, disable sleep.
+4. Right-click `scripts\windows\install_tasks.bat` → *Run as administrator*. It registers: server start at boot,
+   nightly backup 23:30, end-of-day report pack 23:45 (like a MICROS autosequence, filed in `data\reports\<date>\`),
+   and a firewall rule for port 8000 on **Private** networks. `uninstall_tasks.bat` removes them.
+   (Or just double-click `run.bat` to run it by hand.)
+5. First login with PIN 1234 → you must choose a new admin PIN, then follow the setup checklist on the dashboard.
+
+Step-by-step guide for the restaurant: [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md).
 
 **Updating:** stop `run.bat`, run `python scripts\backup.py`, replace the code (keep the `data\` folder!), run `setup.bat` (installs new dependencies), start `run.bat`.
 

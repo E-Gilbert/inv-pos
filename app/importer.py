@@ -408,3 +408,109 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
     c.execute("UPDATE import_batches SET summary = ? WHERE id = ?", (json.dumps(summary), batch))
     audit(c, staff_id, "import.stock_history", "import_batch", batch, summary | {"filename": filename})
     return summary
+
+
+# ---------------------------------------------------------------- menu catalogue (CSV)
+
+MENU_HEADERS = ["category", "major_group", "name", "variant", "price", "description", "days", "active", "flag"]
+
+
+def import_menu_csv(c, data: bytes, staff_id=None, hide_missing=False):
+    """Upsert menu items from a catalogue CSV (see menus/cfc_menu.csv). Matching is by full item name
+    ("Name – Variant"), case-insensitive, so re-importing the same file changes nothing.
+    hide_missing=True hides (never deletes) active items that are not in the file, e.g. demo items.
+    All-or-nothing: any row error and nothing is saved."""
+    from .db import audit
+    from .logic import parse_days
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    reader = csv.DictReader(io.StringIO(text))
+    cols = [h.strip().lower() for h in (reader.fieldnames or [])]
+    if not {"category", "name", "price"} <= set(cols):
+        raise ValueError("The menu CSV needs at least the columns: category, name, price (download the CFC menu file for the full layout).")
+    errors, rows, seen = [], [], set()
+    for n, raw in enumerate(reader, start=2):
+        r = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+        if not any(r.values()):
+            continue
+        name, variant, cat = r.get("name", ""), r.get("variant", ""), r.get("category", "")
+        full = f"{name} – {variant}" if variant else name
+        if not name or not cat:
+            errors.append(f"Row {n}: name and category are required.")
+            continue
+        if len(full) > 80 or len(cat) > 40:
+            errors.append(f"Row {n} ({full}): name or category too long.")
+            continue
+        if full.lower() in seen:
+            errors.append(f"Row {n}: '{full}' appears twice.")
+            continue
+        seen.add(full.lower())
+        try:
+            price = float(r.get("price", ""))
+            if price < 0 or price != price or price > 1e7:
+                raise ValueError
+        except ValueError:
+            errors.append(f"Row {n} ({full}): price must be a number, 0 or more.")
+            continue
+        try:
+            days = ",".join(parse_days(r.get("days", "")))
+        except ValueError as e:
+            errors.append(f"Row {n} ({full}): {e}.")
+            continue
+        active = r.get("active", "1") not in ("0", "no", "false", "hidden")
+        if active and price == 0 and r.get("major_group", "") != "Included sides":
+            errors.append(f"Row {n} ({full}): price is 0. Set a price, or mark it active=0 until it is confirmed.")
+            continue
+        rows.append({"full": full, "group": name if variant else None, "variant": variant or None, "cat": cat,
+                     "major": r.get("major_group") or None, "price": price, "desc": (r.get("description") or "")[:300] or None,
+                     "days": days or None, "active": int(active), "flag": (r.get("flag") or "")[:300] or None})
+    if errors:
+        raise ImportErrors(errors)
+    if not rows:
+        raise ValueError("The file has no menu rows.")
+
+    stats = {"rows": len(rows), "created": 0, "updated": 0, "unchanged": 0, "hidden_items": [], "hidden_missing": [],
+             "price_changes": [], "flags": [r["full"] + ": " + r["flag"] for r in rows if r["flag"]], "categories": 0}
+    cat_ids, sort = {}, 0
+    for r in rows:
+        if r["cat"].lower() not in cat_ids:
+            sort += 1
+            c.execute("INSERT OR IGNORE INTO categories(name, sort) VALUES (?, ?)", (r["cat"], sort))
+            cid = c.execute("SELECT id FROM categories WHERE name = ?", (r["cat"],)).fetchone()["id"]
+            c.execute("UPDATE categories SET sort = ?, major_group = COALESCE(?, major_group) WHERE id = ?", (sort, r["major"], cid))
+            cat_ids[r["cat"].lower()] = cid
+    stats["categories"] = len(cat_ids)
+    for i, r in enumerate(rows):
+        cid = cat_ids[r["cat"].lower()]
+        old = c.execute("SELECT * FROM menu_items WHERE name = ?", (r["full"],)).fetchone()
+        vals = (cid, r["price"], r["active"], r["desc"], r["group"], r["variant"], r["days"], i, r["flag"])
+        if old:
+            same = (old["category_id"], old["price"], old["active"], old["description"], old["variant_group"], old["variant"],
+                    old["available_days"], old["flag"]) == vals[:7] + vals[8:]
+            if same:  # display order alone is not a change worth reporting
+                if old["sort"] != i:
+                    c.execute("UPDATE menu_items SET sort = ? WHERE id = ?", (i, old["id"]))
+                stats["unchanged"] += 1
+                continue
+            c.execute("""UPDATE menu_items SET category_id=?, price=?, active=?, description=?, variant_group=?, variant=?,
+                         available_days=?, sort=?, flag=? WHERE id=?""", vals + (old["id"],))
+            stats["updated"] += 1
+            if abs(old["price"] - r["price"]) > 1e-9:
+                stats["price_changes"].append({"item": r["full"], "old": old["price"], "new": r["price"]})
+                audit(c, staff_id, "menu.price_change", "menu_item", old["id"], {"name": r["full"], "old": old["price"], "new": r["price"], "via": "menu import"})
+        else:
+            c.execute("""INSERT INTO menu_items(name, category_id, price, active, description, variant_group, variant, available_days, sort, flag)
+                         VALUES (?,?,?,?,?,?,?,?,?,?)""", (r["full"],) + vals)
+            stats["created"] += 1
+        if not r["active"]:
+            stats["hidden_items"].append(r["full"])
+    if hide_missing:
+        keep = {r["full"].lower() for r in rows}
+        for m in c.execute("SELECT id, name FROM menu_items WHERE active = 1").fetchall():
+            if m["name"].lower() not in keep:
+                c.execute("UPDATE menu_items SET active = 0 WHERE id = ?", (m["id"],))
+                stats["hidden_missing"].append(m["name"])
+    audit(c, staff_id, "import.menu", "menu", None, {k: (v if not isinstance(v, list) else len(v)) for k, v in stats.items()})
+    return stats

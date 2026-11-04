@@ -1,0 +1,4 @@
+# Cloud mode (Render + Supabase Postgres). The LAN install only needs requirements.txt.
+-r requirements.txt
+psycopg[binary]==3.3.8
+psycopg-pool==3.3.3

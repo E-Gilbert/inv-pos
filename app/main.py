@@ -19,17 +19,18 @@ from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import importer, licence, logic, reports, workbook
+from . import importer, licence, logic, reports, tabs, webauth, workbook
 from .db import BASE_DIR, DATA_DIR, DEFAULT_SETTINGS, audit, get_setting, init_db, now, setting_float, tx
 from .logic import Conflict, RuleError
-from .security import (allowed, hash_pin, hash_token, new_token, permissions_for, throttle,
-                       valid_pin_format, weak_pin)
+from .security import (POS_PERMISSIONS, allowed, hash_pin, hash_token, new_token, permissions_for, pos_enabled,
+                       throttle, valid_pin_format, weak_pin)
 
-VERSION = "0.3.0"
+VERSION = "1.1.0-dev"
 STATIC = os.path.join(BASE_DIR, "static")
 MAX_UPLOAD = 5 * 1024 * 1024
 MAX_BODY = 6 * 1024 * 1024
@@ -53,6 +54,14 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="CFC INV-POS", version=VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+# Cloud mode: let the restaurant website (e.g. https://cityfoodcourt.co.ke/dashboard) call this API.
+# Comma-separated exact origins; nothing is allowed cross-origin unless listed.
+CORS_ORIGINS = [o.strip().rstrip("/") for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if CORS_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=False,
+                       allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+                       allow_headers=["Authorization", "Content-Type", "X-Token", "X-Terminal"], max_age=600)
 
 
 # ---------------------------------------------------------------- middleware / errors
@@ -116,8 +125,29 @@ def client_ip(request: Request):
     return request.client.host if request.client else "?"
 
 
+def _web_staff(request: Request, authorization: str):
+    """Staff member for a website (Supabase) login: matched by e-mail, roles from INV-POS."""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(401, "Please log in.")
+    try:
+        email = webauth.verify(token.strip())
+    except webauth.WebAuthError as e:
+        raise HTTPException(401, str(e)) from None
+    with tx() as c:
+        row = c.execute("SELECT id, name, role FROM staff WHERE email = ? AND active = 1", (email,)).fetchone()
+    if not row:
+        raise HTTPException(403, "This website account is not linked to an active staff member. "
+                                 "Ask an admin to add your e-mail under Setup → Staff.")
+    return {"id": row["id"], "name": row["name"], "role": row["role"], "must_change_pin": False,
+            "ip": client_ip(request), "terminal": None, "via": "web"}
+
+
 def current_staff(request: Request, x_token: Optional[str] = Header(default=None),
-                  x_terminal: Optional[str] = Header(default=None)):
+                  x_terminal: Optional[str] = Header(default=None),
+                  authorization: Optional[str] = Header(default=None)):
+    if not x_token and authorization and webauth.enabled():
+        return _web_staff(request, authorization)
     if not x_token:
         raise HTTPException(401, "Please log in.")
     th = hash_token(x_token)
@@ -148,6 +178,8 @@ def current_staff(request: Request, x_token: Optional[str] = Header(default=None
 
 def need(perm):
     def dep(staff=Depends(current_staff)):
+        if perm in POS_PERMISSIONS and not pos_enabled():
+            raise HTTPException(404, "The till is switched off on this server (inventory-only mode).")
         if not allowed(staff["role"], perm):
             raise HTTPException(403, "You don't have permission to do this.")
         return staff
@@ -214,7 +246,7 @@ def change_pin(body: PinChange, staff=Depends(current_staff), x_token: Optional[
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": VERSION, "time": now()}
+    return {"ok": True, "version": VERSION, "time": now(), "pos": pos_enabled()}
 
 
 @app.get("/api/state")
@@ -239,6 +271,7 @@ def state(staff=Depends(current_staff)):
             "first_day": not c.execute("SELECT 1 FROM days WHERE status='closed'").fetchone(),
             "licence": {k: lic.get(k) for k in ("mode", "enforced", "state", "message", "days_left", "customer")},
             "version": VERSION,
+            "modules": {"pos": pos_enabled()},
         }
 
 
@@ -277,9 +310,10 @@ def menu(staff=Depends(need("stock.view"))):
         cats = [dict(r) for r in c.execute("SELECT * FROM categories ORDER BY sort, name")]
         status = {o["id"]: o["status"] for o in logic.stock_overview(c)}
         items = [dict(r) for r in c.execute(
-            """SELECT m.id, m.name, m.price, m.category_id, m.sku, m.barcode,
+            """SELECT m.id, m.name, m.price, m.category_id, m.sku, m.barcode, m.description, m.variant_group, m.variant,
+                      m.available_days, m.sort,
                       (SELECT COUNT(*) FROM recipe_lines rl WHERE rl.menu_item_id = m.id) AS recipe_lines
-               FROM menu_items m WHERE m.active = 1 ORDER BY m.name""")]
+               FROM menu_items m WHERE m.active = 1 ORDER BY m.sort, m.name""")]
         rec = {}
         for r in c.execute("SELECT menu_item_id, ingredient_id FROM recipe_lines"):
             rec.setdefault(r["menu_item_id"], []).append(r["ingredient_id"])
@@ -293,6 +327,7 @@ def menu(staff=Depends(need("stock.view"))):
 class OrderLine(BaseModel):
     menu_item_id: int
     qty: int = Field(ge=1, le=1000)
+    note: Optional[str] = Field(default=None, max_length=120)
 
 
 class Discount(BaseModel):
@@ -315,8 +350,9 @@ class NewOrder(BaseModel):
 
 def receipt(c, order_id):
     o = c.execute(
-        """SELECT o.*, s.name AS cashier, d.business_date FROM orders o
-           JOIN staff s ON s.id = o.staff_id JOIN days d ON d.id = o.day_id WHERE o.id = ?""", (order_id,)).fetchone()
+        """SELECT o.*, s.name AS cashier, d.business_date, sv.name AS server, t.label AS tab_label FROM orders o
+           JOIN staff s ON s.id = o.staff_id JOIN days d ON d.id = o.day_id
+           LEFT JOIN staff sv ON sv.id = o.server_id LEFT JOIN tabs t ON t.id = o.tab_id WHERE o.id = ?""", (order_id,)).fetchone()
     if not o:
         raise HTTPException(404, "Order not found.")
     out = dict(o)
@@ -328,6 +364,7 @@ def receipt(c, order_id):
     out["tax_label"] = get_setting(c, "tax_label")
     out["business_pin"] = get_setting(c, "business_pin")
     out["business_address"] = get_setting(c, "business_address")
+    out["business_phone"] = get_setting(c, "business_phone")
     return out
 
 
@@ -412,6 +449,103 @@ def refund(order_id: int, body: Refund, staff=Depends(need("pos.sell"))):
                                       body.method, body.client_ref, body.approver_pin)
         out = receipt(c, order_id)
         out["refund_id"], out["duplicate"] = rid, dup
+        return out
+
+
+# ---------------------------------------------------------------- open checks (tabs)
+
+class TabIn(BaseModel):
+    label: str = Field(min_length=1, max_length=30)
+    order_type: Optional[str] = Field(default=None, max_length=30)
+    guests: Optional[int] = Field(default=None, ge=0, le=500)
+    client_ref: Optional[str] = Field(default=None, min_length=8, max_length=64)
+
+
+class TabItems(BaseModel):
+    items: list[OrderLine] = Field(min_length=1, max_length=200)
+    send: bool = True
+    batch_ref: Optional[str] = Field(default=None, min_length=8, max_length=64)
+
+
+class Reason(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=200)
+    approver_pin: Optional[str] = Field(default=None, max_length=12)
+
+
+class TabPay(BaseModel):
+    payment_method: Literal["cash", "mpesa", "card"]
+    amount_tendered: Optional[float] = Field(default=None, ge=0, le=10_000_000)
+    payment_ref: Optional[str] = Field(default=None, max_length=40)
+    discount: Optional[Discount] = None
+    approver_pin: Optional[str] = Field(default=None, max_length=12)
+    client_ref: Optional[str] = Field(default=None, min_length=8, max_length=64)
+    guests: Optional[int] = Field(default=None, ge=0, le=500)
+
+
+@app.get("/api/tabs")
+def list_tabs(staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        return tabs.list_open(c)
+
+
+@app.post("/api/tabs")
+def open_tab(body: TabIn, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        licence.gate(c, "sell", staff["terminal"])
+        tid = tabs.open_tab(c, staff, body.label, body.order_type, body.guests, body.client_ref)
+        return tabs.view(c, tid)
+
+
+@app.get("/api/tabs/{tab_id}")
+def get_tab(tab_id: int, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        return tabs.view(c, tab_id)
+
+
+@app.post("/api/tabs/{tab_id}/items")
+def tab_items(tab_id: int, body: TabItems, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        added = tabs.add_items(c, staff, tab_id, [i.model_dump() for i in body.items], body.send, body.batch_ref)
+        out = tabs.view(c, tab_id)
+        out["added_line_ids"] = added
+        return out
+
+
+@app.post("/api/tabs/{tab_id}/send")
+def tab_send(tab_id: int, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        sent = tabs.send(c, staff, tab_id)
+        out = tabs.view(c, tab_id)
+        out["added_line_ids"] = sent
+        return out
+
+
+@app.post("/api/tab-lines/{line_id}/remove")
+def tab_line_remove(line_id: int, body: Reason, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        tab_id = c.execute("SELECT tab_id FROM tab_lines WHERE id = ?", (line_id,)).fetchone()
+        if not tab_id:
+            raise HTTPException(404, "Not found.")
+        tabs.remove_line(c, staff, line_id, body.reason, body.approver_pin)
+        return tabs.view(c, tab_id["tab_id"])
+
+
+@app.post("/api/tabs/{tab_id}/cancel")
+def tab_cancel(tab_id: int, body: Reason, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        tabs.cancel(c, staff, tab_id, body.reason or "", body.approver_pin)
+        return tabs.view(c, tab_id)
+
+
+@app.post("/api/tabs/{tab_id}/pay")
+def tab_pay(tab_id: int, body: TabPay, staff=Depends(need("pos.sell"))):
+    with tx() as c:
+        licence.gate(c, "sell", staff["terminal"])
+        oid, dup = tabs.pay(c, staff, tab_id, body.payment_method, body.amount_tendered, body.payment_ref,
+                            body.discount.model_dump() if body.discount else None, body.approver_pin, body.client_ref,
+                            staff["terminal"], body.guests)
+        out = receipt(c, oid)
+        out["duplicate"] = dup
         return out
 
 
@@ -775,14 +909,22 @@ EXPORTS = {
                   ("qty", "Qty (signed)"), ("unit_cost", "Unit cost"), ("reason", "Reason"), ("note", "Note"),
                   ("order_number", "Receipt #"), ("staff", "By")],
     "sales": [("name", "Menu item"), ("qty", "Qty"), ("amt", "Amount at list price")],
+    "menu": [(k, k) for k in importer.MENU_HEADERS],
 }
 
 
 @app.get("/api/export/{kind}.csv")
-def export_csv(kind: Literal["stock", "movements", "sales"], date_from: Optional[str] = None, date_to: Optional[str] = None,
+def export_csv(kind: Literal["stock", "movements", "sales", "menu"], date_from: Optional[str] = None, date_to: Optional[str] = None,
                staff=Depends(need("data.export"))):
     with tx() as c:
-        if kind == "stock":
+        if kind == "menu":
+            rows = [dict(r) for r in c.execute(
+                """SELECT COALESCE(cat.name, '') AS category, COALESCE(cat.major_group, '') AS major_group,
+                          COALESCE(m.variant_group, m.name) AS name, COALESCE(m.variant, '') AS variant, m.price,
+                          COALESCE(m.description, '') AS description, COALESCE(m.available_days, '') AS days,
+                          m.active, COALESCE(m.flag, '') AS flag
+                   FROM menu_items m LEFT JOIN categories cat ON cat.id = m.category_id ORDER BY cat.sort, m.sort, m.name""")]
+        elif kind == "stock":
             rows = logic.stock_overview(c)
         elif kind == "movements":
             rows = _movements(c, date_from=date_from, date_to=date_to, limit=5000)
@@ -895,7 +1037,16 @@ class MenuItem(BaseModel):
     active: bool = True
     sku: Optional[str] = Field(default=None, max_length=40)
     barcode: Optional[str] = Field(default=None, max_length=40)
+    description: Optional[str] = Field(default=None, max_length=300)
+    variant_group: Optional[str] = Field(default=None, max_length=60)
+    variant: Optional[str] = Field(default=None, max_length=40)
+    available_days: Optional[str] = Field(default=None, max_length=40)
     recipe: list[RecipeLine] = Field(default=[], max_length=50)
+
+    @field_validator("available_days")
+    @classmethod
+    def _days(cls, v):
+        return ",".join(logic.parse_days(v)) or None
 
 
 @app.get("/api/menu-items")
@@ -928,15 +1079,19 @@ def _save_item(c, body: MenuItem, staff, iid=None):
     sku, bc = _blank(body.sku), _blank(body.barcode)
     _check_codes(c, "menu_items", sku, bc, iid)
     if iid is None:
-        iid = c.execute("INSERT INTO menu_items(name, category_id, price, active, sku, barcode) VALUES (?,?,?,?,?,?)",
-                        (body.name.strip(), cat_id, body.price, int(body.active), sku, bc)).lastrowid
+        iid = c.execute("""INSERT INTO menu_items(name, category_id, price, active, sku, barcode, description, variant_group,
+                                                  variant, available_days) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (body.name.strip(), cat_id, body.price, int(body.active), sku, bc, _blank(body.description),
+                         _blank(body.variant_group), _blank(body.variant), body.available_days)).lastrowid
         audit(c, staff["id"], "menu.create", "menu_item", iid, {"name": body.name, "price": body.price})
     else:
         old = c.execute("SELECT * FROM menu_items WHERE id = ?", (iid,)).fetchone()
         if not old:
             raise HTTPException(404, "Not found.")
-        c.execute("UPDATE menu_items SET name=?, category_id=?, price=?, active=?, sku=?, barcode=? WHERE id=?",
-                  (body.name.strip(), cat_id, body.price, int(body.active), sku, bc, iid))
+        c.execute("""UPDATE menu_items SET name=?, category_id=?, price=?, active=?, sku=?, barcode=?, description=?,
+                     variant_group=?, variant=?, available_days=?, flag=NULL WHERE id=?""",
+                  (body.name.strip(), cat_id, body.price, int(body.active), sku, bc, _blank(body.description),
+                   _blank(body.variant_group), _blank(body.variant), body.available_days, iid))
         if abs(old["price"] - body.price) > 1e-9:
             audit(c, staff["id"], "menu.price_change", "menu_item", iid, {"name": body.name, "old": old["price"], "new": body.price})
     old_recipe = {r["ingredient_id"]: r["qty"] for r in c.execute("SELECT ingredient_id, qty FROM recipe_lines WHERE menu_item_id=?", (iid,))}
@@ -969,13 +1124,30 @@ class Staff(BaseModel):
     pin: str = Field(default="", max_length=12)
     role: Literal["cashier", "stock_controller", "manager", "admin"]
     active: bool = True
+    # Website login e-mail (cloud mode). Omit to leave unchanged; "" removes the link.
+    email: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v):
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v and ("@" not in v or v.startswith("@") or v.endswith("@") or " " in v or "." not in v.split("@")[-1]):
+            raise ValueError("enter a valid e-mail address, or leave it blank")
+        return v
+
+
+def _check_email(c, email, own_id=None):
+    if email and c.execute("SELECT 1 FROM staff WHERE email = ? AND id <> ?", (email, own_id or -1)).fetchone():
+        raise HTTPException(400, "That e-mail is already linked to another staff member.")
 
 
 @app.get("/api/staff")
 def staff_list(staff=Depends(need("staff.manage"))):
     with tx() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id, name, role, active, must_change_pin, created_at FROM staff ORDER BY active DESC, name")]
+            "SELECT id, name, role, active, must_change_pin, email, created_at FROM staff ORDER BY active DESC, name")]
 
 
 def _check_pin(c, pin, role, own_id=None):
@@ -991,8 +1163,9 @@ def _check_pin(c, pin, role, own_id=None):
 def add_staff(body: Staff, staff=Depends(need("staff.manage"))):
     with tx() as c:
         _check_pin(c, body.pin, body.role)
-        sid = c.execute("INSERT INTO staff(name, pin_hash, role, active, must_change_pin) VALUES (?,?,?,?,1)",
-                        (body.name.strip(), hash_pin(body.pin), body.role, int(body.active))).lastrowid
+        _check_email(c, body.email)
+        sid = c.execute("INSERT INTO staff(name, pin_hash, role, active, must_change_pin, email) VALUES (?,?,?,?,1,?)",
+                        (body.name.strip(), hash_pin(body.pin), body.role, int(body.active), body.email or None)).lastrowid
         audit(c, staff["id"], "staff.create", "staff", sid, {"name": body.name, "role": body.role}, staff["ip"])
     return {"ok": True, "id": sid}
 
@@ -1011,11 +1184,15 @@ def edit_staff(sid: int, body: Staff, staff=Depends(need("staff.manage"))):
             _check_pin(c, body.pin, body.role, sid)
             c.execute("UPDATE staff SET pin_hash=?, must_change_pin=1 WHERE id=?", (hash_pin(body.pin), sid))
         c.execute("UPDATE staff SET name=?, role=?, active=? WHERE id=?", (body.name.strip(), body.role, int(body.active), sid))
+        if "email" in body.model_fields_set:
+            _check_email(c, body.email, sid)
+            c.execute("UPDATE staff SET email=? WHERE id=?", (body.email or None, sid))
         if not body.active or body.role != old["role"] or body.pin:
             c.execute("DELETE FROM sessions WHERE staff_id = ?", (sid,))
         audit(c, staff["id"], "staff.edit", "staff", sid,
               {"name": [old["name"], body.name], "role": [old["role"], body.role], "active": [bool(old["active"]), body.active],
-               "pin_reset": bool(body.pin)}, staff["ip"])
+               "pin_reset": bool(body.pin),
+               "email": [old["email"], body.email] if "email" in body.model_fields_set else None}, staff["ip"])
     return {"ok": True}
 
 
@@ -1034,6 +1211,7 @@ class Settings(BaseModel):
     cost_method: Literal["manual", "last_purchase", "weighted_average"] = "manual"
     require_shift: bool = True
     session_idle_minutes: int = Field(default=720, ge=5, le=1440)
+    business_phone: str = Field(default="", max_length=30)
     order_types: str = Field(default="Dine in,Takeaway,Delivery", min_length=1, max_length=200)
     ask_guests: bool = False
     serving_periods: str = Field(default=DEFAULT_SETTINGS["serving_periods"], max_length=300)
@@ -1131,6 +1309,54 @@ async def excel_import(file: UploadFile = File(...), preview: bool = Query(False
             raise
         raise ValueError("Couldn't read that file. Is it a valid .xlsx or .csv?") from e
     return {"preview": False, **stats}
+
+
+@app.post("/api/import/menu")
+async def menu_import(file: UploadFile = File(...), preview: bool = Query(False), hide_missing: bool = Query(False),
+                      staff=Depends(need("data.import"))):
+    """Menu catalogue CSV (category, major_group, name, variant, price, description, days, active, flag)."""
+    data = await _read_upload(file)
+    try:
+        with tx() as c:
+            stats = importer.import_menu_csv(c, data, staff["id"], hide_missing)
+            if preview:
+                raise _Preview(stats)
+    except _Preview as p:
+        return {"preview": True, **p.result}
+    return {"preview": False, **stats}
+
+
+@app.get("/api/setup/status")
+def setup_status(staff=Depends(need("reports.view"))):
+    """First-run checklist shown on the dashboard until everything is green."""
+    with tx() as c:
+        s = lambda k: get_setting(c, k)  # noqa: E731
+        n = lambda q: c.execute(q).fetchone()[0]  # noqa: E731
+        backups = os.path.join(DATA_DIR, "backups")
+        recent = sorted((f for f in os.listdir(backups) if f.startswith("cfc-")), reverse=True)[:1] if os.path.isdir(backups) else []
+        ings = n("SELECT COUNT(*) FROM ingredients WHERE active = 1")
+        checks = [
+            ("pins", "Default admin PIN replaced", n("SELECT COUNT(*) FROM staff WHERE role='admin' AND active=1 AND must_change_pin=0") > 0),
+            ("business", "Business name, address and phone set", bool(s("business_name") and s("business_address") and s("business_phone"))),
+            ("tax", "VAT setting confirmed (rate and inclusive/exclusive)", s("tax_rate_pct") not in (None, "", "0") or s("tax_confirmed") == "1"),
+            ("menu", "Menu loaded", n("SELECT COUNT(*) FROM menu_items WHERE active = 1") > 0),
+            ("flags", "Menu items needing a price decision reviewed",
+             n("SELECT COUNT(*) FROM menu_items WHERE flag IS NOT NULL AND flag <> ''") == 0),
+            ("staff", "Staff accounts created (servers, cashiers, managers)", n("SELECT COUNT(*) FROM staff WHERE active = 1") >= 3),
+            ("stock", "Stock items set up", ings > 0),
+            ("costs", "Purchase costs entered for stock items",
+             ings > 0 and n("SELECT COUNT(*) FROM ingredients WHERE active = 1 AND cost_per_unit > 0") == ings),
+            ("reorder", "Reorder levels set (for stock colours)",
+             ings > 0 and n("SELECT COUNT(*) FROM ingredients WHERE active = 1 AND par_level > 0") == ings),
+            ("recipes", "Recipes linked so sales deduct stock",
+             n("SELECT COUNT(DISTINCT menu_item_id) FROM recipe_lines") > 0),
+            ("day", "First business day opened", n("SELECT COUNT(*) FROM days WHERE source = 'app'") > 0),
+            ("backup", "A database backup exists (scripts/backup.py)", bool(recent)),
+        ]
+        return {"items": [{"key": k, "label": l, "done": bool(d)} for k, l, d in checks],
+                "flagged_items": [dict(r) for r in c.execute(
+                    "SELECT id, name, price, active, flag FROM menu_items WHERE flag IS NOT NULL AND flag <> '' ORDER BY sort")],
+                "last_backup": recent[0] if recent else None}
 
 
 @app.post("/api/import/stock-workbook")

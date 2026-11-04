@@ -232,3 +232,23 @@ tr.st-row-grey td { color: var(--grey); }
 .rgroup .btn { text-align: left; }
 tr.totrow td { border-top: 2px solid var(--ink); background: #faf7f3; }
 @media print { .printrep h2 { font-size: 15px; } .printrep .tablewrap { overflow: visible; } }
+
+/* ---------- v1.0: open checks, variants, notes ---------- */
+.tabsbar { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 6px; }
+.tabsbar button { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 8px 12px; white-space: nowrap; min-height: 44px; }
+.tabsbar button.active { background: var(--brand); color: #fff; border-color: var(--brand); }
+.tabsbar button.new { border-style: dashed; font-weight: 700; }
+.tabsbar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+.tabhead { display: flex; justify-content: space-between; align-items: start; gap: 8px; margin-bottom: 8px; }
+.line.sent { background: #faf7f3; }
+.line .qty button[data-rm] { color: var(--bad); }
+.noteable { cursor: pointer; }
+.item.off { opacity: .45; }
+.vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.vgrid .btn { min-height: 70px; text-align: center; }
+.vgrid .p { color: var(--brand); font-weight: 800; }
+.vgrid .btn.off { opacity: .4; }
+.checklist li { margin: 4px 0; list-style: none; }
+.checklist { padding-left: 0; }
+.pos > div { min-width: 0; }
+.tabsbar, .cats { max-width: 100%; }

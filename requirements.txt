@@ -4,3 +4,4 @@ uvicorn==0.50.0
 openpyxl==3.1.5
 python-multipart==0.0.31
 cryptography==50.0.1
+PyJWT==2.15.0

@@ -16,3 +16,4 @@ data/licence_public.key
 data/server.id
 data/*.log
 data/reports/
+data/maintenance.flag

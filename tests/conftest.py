@@ -1,4 +1,8 @@
-"""Shared test setup: a throw-away database and secret per test session, never data/cfc.db."""
+"""Shared test setup: a throw-away database and secret per test session, never data/cfc.db.
+
+Runs on SQLite by default; set DATABASE_URL to a scratch Postgres database to run the same
+tests on the cloud backend.
+"""
 import os
 import tempfile
 import uuid
@@ -6,6 +10,10 @@ import uuid
 _tmp = tempfile.mkdtemp(prefix="cfc-test-")
 os.environ["CFC_DB"] = os.path.join(_tmp, "test.db")
 os.environ.pop("CFC_LICENCE_MODE", None)
+if os.environ.get("DATABASE_URL"):
+    # Postgres run (e.g. DATABASE_URL=postgresql://postgres@127.0.0.1/invpos_test pytest). The test
+    # database is wiped: never point this at a real one.
+    os.environ.setdefault("INVPOS_SECRET", "ab" * 32)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

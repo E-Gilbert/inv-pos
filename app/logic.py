@@ -210,8 +210,23 @@ def close_shift(c, shift_id, staff, counted_cash, notes=None):
 
 # ---------------------------------------------------------------- selling
 
-def price_order(c, items, discount=None):
-    """Prices always come from the database, never the till. Returns lines + totals."""
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def parse_days(text):
+    """'Thu' / 'Mon,Fri' -> ['Thu'] / ['Mon','Fri']; empty -> [] (every day). Raises ValueError on junk."""
+    out = []
+    for d in [x.strip()[:3].title() for x in (text or "").replace(";", ",").split(",") if x.strip()]:
+        if d not in WEEKDAYS:
+            raise ValueError(f"'{d}' is not a weekday (use Mon, Tue, Wed, Thu, Fri, Sat, Sun)")
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def price_order(c, items, discount=None, business_date=None):
+    """Prices always come from the database, never the till. Returns lines + totals.
+    Lines with the same item and the same note are merged; different notes stay separate lines."""
     if not items:
         raise RuleError("The order is empty.")
     if len(items) > 200:
@@ -222,13 +237,18 @@ def price_order(c, items, discount=None):
         qty = int(it.get("qty", 0))
         if qty <= 0 or qty > 1000:
             raise RuleError("Quantities must be between 1 and 1000.")
-        mid = int(it["menu_item_id"])
-        merged[mid] = merged.get(mid, 0) + qty
-    for mid, qty in merged.items():
-        mi = c.execute("SELECT id, name, price FROM menu_items WHERE id = ? AND active = 1", (mid,)).fetchone()
+        note = (it.get("note") or "").strip()[:120] or None
+        key = (int(it["menu_item_id"]), note)
+        merged[key] = merged.get(key, 0) + qty
+    weekday = WEEKDAYS[date.fromisoformat(business_date).weekday()] if business_date else None
+    for (mid, note), qty in merged.items():
+        mi = c.execute("SELECT id, name, price, available_days FROM menu_items WHERE id = ? AND active = 1", (mid,)).fetchone()
         if not mi:
             raise RuleError("An item in the order is no longer on the menu.")
-        lines.append((mi, qty))
+        days = parse_days(mi["available_days"])
+        if weekday and days and weekday not in days:
+            raise RuleError(f"{mi['name']} is only sold on {', '.join(days)}.")
+        lines.append((mi, qty, note))
         subtotal += dec(mi["price"]) * qty
     subtotal = subtotal.quantize(D2, rounding=ROUND_HALF_UP)
 
@@ -269,11 +289,11 @@ def order_types(c):
 
 def create_order(c, staff, items, payment_method, amount_tendered=None, payment_ref=None,
                  discount=None, approver_pin=None, client_ref=None, terminal_id=None,
-                 order_type=None, guests=None):
+                 order_type=None, guests=None, tab=None):
     """Returns (order_id, duplicate). A repeated client_ref returns the original order and
     changes nothing, so a till that retries after a network drop can never double-charge or
     double-deduct stock."""
-    payload = {"items": sorted((int(i["menu_item_id"]), int(i.get("qty", 0))) for i in items or []),
+    payload = {"items": sorted((int(i["menu_item_id"]), int(i.get("qty", 0)), (i.get("note") or "").strip()) for i in items or []),
                "pm": payment_method, "tend": amount_tendered, "ref": (payment_ref or "").strip().upper(),
                "disc": discount, "ot": order_type, "g": guests}
     rh = request_hash(payload)
@@ -300,7 +320,7 @@ def create_order(c, staff, items, payment_method, amount_tendered=None, payment_
         if not 0 <= guests <= 500:
             raise RuleError("Guest count must be between 0 and 500.")
 
-    p = price_order(c, items, discount)
+    p = price_order(c, items, discount, day["business_date"])
     discount_by = None
     if p["discount"] > 0:
         reason = ((discount or {}).get("reason") or "").strip()
@@ -340,17 +360,19 @@ def create_order(c, staff, items, payment_method, amount_tendered=None, payment_
     oid = c.execute(
         """INSERT INTO orders(day_id, number, staff_id, created_at, subtotal, discount, discount_reason, discount_by,
                               tax, tax_rate, tax_inclusive, total, payment_method, amount_tendered, payment_ref,
-                              payment_status, shift_id, client_ref, request_hash, terminal_id, order_type, guests)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual_confirmed',?,?,?,?,?,?)""",
+                              payment_status, shift_id, client_ref, request_hash, terminal_id, order_type, guests,
+                              tab_id, server_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual_confirmed',?,?,?,?,?,?,?,?)""",
         (day["id"], number, staff["id"], now(), float(p["subtotal"]), float(p["discount"]),
          ((discount or {}).get("reason") or "").strip() or None, discount_by, float(p["tax"]), p["tax_rate"],
          int(p["tax_inclusive"]), float(total), payment_method, tendered, payment_ref,
-         shift["id"] if shift else None, client_ref, rh, terminal_id, order_type, guests),
+         shift["id"] if shift else None, client_ref, rh, terminal_id, order_type, guests,
+         tab["id"] if tab else None, tab["staff_id"] if tab else staff["id"]),
     ).lastrowid
 
-    for mi, qty in p["lines"]:
-        oi = c.execute("INSERT INTO order_items(order_id, menu_item_id, name, price, qty) VALUES (?, ?, ?, ?, ?)",
-                       (oid, mi["id"], mi["name"], mi["price"], qty)).lastrowid
+    for mi, qty, note in p["lines"]:
+        oi = c.execute("INSERT INTO order_items(order_id, menu_item_id, name, price, qty, note) VALUES (?, ?, ?, ?, ?, ?)",
+                       (oid, mi["id"], mi["name"], mi["price"], qty, note)).lastrowid
         # Deduct raw materials using the recipe as it is right now (snapshot), with today's cost.
         for rl in c.execute("""SELECT rl.ingredient_id, rl.qty, i.cost_per_unit FROM recipe_lines rl
                                JOIN ingredients i ON i.id = rl.ingredient_id WHERE rl.menu_item_id = ?""", (mi["id"],)).fetchall():
@@ -396,7 +418,7 @@ def void_order(c, order_id, staff_id, reason):
 
 
 def refundable_lines(c, order_id):
-    rows = c.execute("""SELECT oi.id, oi.name, oi.price, oi.qty,
+    rows = c.execute("""SELECT oi.id, oi.name, oi.price, oi.qty, oi.note,
                                COALESCE((SELECT SUM(rl.qty) FROM refund_lines rl WHERE rl.order_item_id = oi.id), 0) AS refunded_qty
                         FROM order_items oi WHERE oi.order_id = ? ORDER BY oi.id""", (order_id,)).fetchall()
     return [dict(r) | {"refundable_qty": r["qty"] - r["refunded_qty"]} for r in rows]
@@ -695,7 +717,7 @@ def day_lines(c, day_id, ingredient_id=None):
         JOIN ingredients i ON i.id = ds.ingredient_id
         LEFT JOIN stock_movements m ON m.day_id = ds.day_id AND m.ingredient_id = ds.ingredient_id
         WHERE ds.day_id = ? {"AND ds.ingredient_id = ?" if ingredient_id else ""}
-        GROUP BY i.id
+        GROUP BY i.id, ds.day_id, ds.ingredient_id
         ORDER BY i.count_daily DESC, i.name
         """,
         (day_id, ingredient_id) if ingredient_id else (day_id,),
@@ -724,6 +746,9 @@ def close_day(c, staff_id, counts, notes=None):
                                WHERE sh.day_id = ? AND sh.status = 'open'""", (day["id"],)).fetchall()
     if open_shifts:
         raise RuleError("Close these shifts first (count the cash): " + ", ".join(r["name"] for r in open_shifts))
+    open_tabs = c.execute("SELECT label FROM tabs WHERE status = 'open' ORDER BY label").fetchall()
+    if open_tabs:
+        raise RuleError("These checks are still open (pay or cancel them first): " + ", ".join(r["label"] for r in open_tabs))
     pct = setting_float(c, "variance_tolerance_pct")
     counts = {int(k): v for k, v in (counts or {}).items()}
     problems, final = [], []
@@ -871,7 +896,7 @@ def sales_summary(c, day_ids):
     rf_by = [dict(r) for r in c.execute(f"""SELECT method, COUNT(*) n, COALESCE(SUM(amount),0) amt FROM refunds
                                             WHERE day_id IN ({ph}) GROUP BY method""", day_ids)]
     items = [dict(r) for r in c.execute(
-        f"""SELECT oi.menu_item_id, oi.name, SUM(oi.qty) qty, SUM(oi.qty * oi.price) amt,
+        f"""SELECT oi.menu_item_id, MAX(oi.name) AS name, SUM(oi.qty) qty, SUM(oi.qty * oi.price) amt,
                    (SELECT COUNT(*) FROM recipe_lines rl WHERE rl.menu_item_id = oi.menu_item_id) AS recipe_lines
             FROM order_items oi JOIN orders o ON o.id = oi.order_id
             WHERE o.day_id IN ({ph}) AND o.status = 'paid' GROUP BY oi.menu_item_id ORDER BY qty DESC""", day_ids)]
@@ -879,7 +904,7 @@ def sales_summary(c, day_ids):
         f"""SELECT m.ingredient_id, i.name, SUM(-m.qty * COALESCE(m.unit_cost, i.cost_per_unit)) cost,
                    MAX(CASE WHEN COALESCE(m.unit_cost, i.cost_per_unit) = 0 THEN 1 ELSE 0 END) uncosted
             FROM stock_movements m JOIN ingredients i ON i.id = m.ingredient_id
-            WHERE m.day_id IN ({ph}) AND m.type IN ('sale','void','refund') GROUP BY m.ingredient_id""", day_ids).fetchall()
+            WHERE m.day_id IN ({ph}) AND m.type IN ('sale','void','refund') GROUP BY m.ingredient_id, i.id""", day_ids).fetchall()
     cogs = sum(dec(r["cost"]) for r in cogs_rows)
     net_ex_tax = dec(o["total"]) - dec(o["tax"]) - (dec(rf["a"]) - dec(rf["t"]))
     gp = net_ex_tax - cogs

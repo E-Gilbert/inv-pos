@@ -19,7 +19,12 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.db import DATA_DIR, DB_PATH  # noqa: E402
+from app.db import BACKEND, DATA_DIR, DB_PATH  # noqa: E402
+
+if BACKEND == "postgres":
+    sys.exit("Cloud mode uses Postgres: back it up with pg_dump instead, e.g.\n"
+             '  pg_dump "%DATABASE_URL%" --schema=inventory -Fc -f inv-pos-YYYYMMDD.dump\n'
+             "See docs/CLOUD.md (Backups).")
 
 out_dir = os.path.join(DATA_DIR, "backups")
 os.makedirs(out_dir, exist_ok=True)

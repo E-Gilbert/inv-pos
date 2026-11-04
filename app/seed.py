@@ -8,7 +8,7 @@ All prices, costs and quantities here are placeholders, not CFC's real numbers.
 import os
 import sys
 
-from .db import DB_PATH, init_db, tx
+from .db import BACKEND, DATABASE_URL, DB_PATH, init_db, tx
 from .security import hash_pin
 
 STAFF = [("Admin", "1234", "admin"), ("Manager Demo", "2222", "manager"), ("Cashier Demo", "1111", "cashier")]
@@ -46,14 +46,21 @@ MENU = [
 ]
 
 
+def _exists():
+    return BACKEND == "postgres" or os.path.exists(DB_PATH)
+
+
 def seed(reset=False, force=False):
-    if os.path.exists(DB_PATH) and not force:
+    if _exists() and not force:
         init_db()
         with tx() as c:
             if c.execute("SELECT 1 FROM days LIMIT 1").fetchone():
                 raise SystemExit("This database already has business days. Refusing to add demo data to (or wipe) real "
                                  "records. Use a separate CFC_DB file for demos.")
-    if reset and os.path.exists(DB_PATH):
+    if reset and BACKEND == "postgres":
+        from . import pg
+        pg.wipe(DATABASE_URL)
+    elif reset and os.path.exists(DB_PATH):
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(DB_PATH + suffix):
                 os.remove(DB_PATH + suffix)

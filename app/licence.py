@@ -56,6 +56,9 @@ def public_key_b64():
 
 
 def server_id():
+    env = os.environ.get("INVPOS_SERVER_ID", "").strip()
+    if env:  # cloud hosts have no lasting disk: pin the id in the environment instead
+        return env
     if not os.path.exists(SERVER_ID_FILE):
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(SERVER_ID_FILE, "w") as f:

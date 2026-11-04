@@ -1,0 +1,36 @@
+# Render Blueprint for INV-POS cloud mode (inventory engine for the CFC website).
+# Render dashboard → New → Blueprint → pick the E-Gilbert/inv-pos repo. Values marked
+# `sync: false` are asked for once in the dashboard and never stored in git.
+# Full guide: docs/CLOUD.md
+services:
+  - type: web
+    name: inv-pos-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: pip install -r requirements-cloud.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips '*'
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      - key: TZ
+        value: Africa/Nairobi
+      - key: POS_MODULE
+        value: "off"
+      - key: DATABASE_URL          # Supabase → Connect → Session pooler URI (port 5432)
+        sync: false
+      - key: INVPOS_PG_SCHEMA      # keeps INV-POS tables apart from the website's
+        value: inventory
+      - key: INVPOS_SECRET         # 64 hex chars; generate once, keep a copy offline
+        sync: false
+      - key: INVPOS_SERVER_ID
+        value: cfc-cloud-1
+      - key: SUPABASE_URL          # https://<project>.supabase.co
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://cityfoodcourt.co.ke,https://www.cityfoodcourt.co.ke
+      - key: INVPOS_PG_POOL
+        value: "3"

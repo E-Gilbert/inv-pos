@@ -218,7 +218,7 @@ def parse(data: bytes, filename="", year=None, month=None):
         missing = [d for d in range(min(covered), max(covered) + 1) if d not in covered]
         for d in missing:
             issue("warning", None, None, f"No sheet for day {d} of the month: stock movement for that day is unrecorded.", "missing_day")
-    for prev, cur in zip(sheets, sheets[1:]):
+    for prev, cur in zip(sheets, sheets[1:], strict=False):
         pc = {r["key"]: r for r in prev["rows"]}
         for r in cur["rows"]:
             p = pc.get(r["key"])

@@ -23,7 +23,7 @@ def make_workbook(break_carry=False, dup=False):
     }
     for name, rows in data.items():
         ws = wb.create_sheet(name)
-        for col, h in zip("CDEFGH", ["opening", "additions", "closing", "actual sales", "system sales", "variance"]):
+        for col, h in zip("CDEFGH", ["opening", "additions", "closing", "actual sales", "system sales", "variance"], strict=True):
             ws[f"{col}2"] = h
         for i, (item, o, a, c, sysv, note) in enumerate(rows + ([rows[0]] if dup and name == "1st" else []), start=3):
             ws[f"B{i}"], ws[f"C{i}"], ws[f"D{i}"], ws[f"E{i}"] = item, o, a, c

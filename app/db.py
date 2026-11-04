@@ -1,6 +1,11 @@
-"""SQLite database: connection, schema and migrations.
+"""Database: connection, schema and migrations.
 
-One file (data/cfc.db) holds everything. SQLite is fine for a single restaurant on a LAN:
+Two backends, same code:
+* SQLite (default) — the restaurant-LAN install. One file (data/cfc.db) holds everything.
+* Postgres (cloud mode) — set DATABASE_URL=postgresql://... (e.g. Supabase). See app/pg.py and
+  docs/CLOUD.md. Schema lives in app/schema_pg.sql.
+
+SQLite notes: one file holds everything. SQLite is fine for a single restaurant on a LAN:
 a few tills writing a few orders a minute is nothing for it. WAL mode lets report screens
 read while tills write.
 
@@ -20,7 +25,9 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("CFC_DB", os.path.join(BASE_DIR, "data", "cfc.db"))
 DATA_DIR = os.path.dirname(DB_PATH)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+BACKEND = "postgres" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
 
 # ---------------------------------------------------------------- v1 (original v0.1 schema)
 SCHEMA_V1 = """
@@ -175,10 +182,14 @@ DEFAULT_SETTINGS = {
     "order_types": "Dine in,Takeaway,Delivery",
     "ask_guests": "0",
     "serving_periods": "Breakfast=05:00-11:00;Lunch=11:00-16:00;Dinner=16:00-05:00",
+    "business_phone": "",
 }
 
 
 def connect():
+    if BACKEND == "postgres":
+        from . import pg
+        return pg.connect(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)  # we manage transactions
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -205,7 +216,7 @@ def tx():
 
 
 def _backup_before_migration(version):
-    if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0:
+    if BACKEND != "sqlite" or not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0:
         return None
     out = os.path.join(DATA_DIR, "backups")
     os.makedirs(out, exist_ok=True)
@@ -319,10 +330,50 @@ def _migrate_to_3(c):
     c.execute("CREATE INDEX IF NOT EXISTS ix_refunds_day ON refunds(day_id)")
 
 
-MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3}
+def _migrate_to_4(c):
+    """Menu catalogue fields (variants, descriptions, sale days), line notes, and open checks (tabs)."""
+    for col, ddl in [("description", "TEXT"), ("variant_group", "TEXT"), ("variant", "TEXT"),
+                     ("available_days", "TEXT"), ("sort", "INTEGER NOT NULL DEFAULT 0"), ("flag", "TEXT")]:
+        if col not in _cols(c, "menu_items"):
+            c.execute(f"ALTER TABLE menu_items ADD COLUMN {col} {ddl}")
+    if "note" not in _cols(c, "order_items"):
+        c.execute("ALTER TABLE order_items ADD COLUMN note TEXT")
+    for col, ddl in [("tab_id", "INTEGER"), ("server_id", "INTEGER REFERENCES staff(id)")]:
+        if col not in _cols(c, "orders"):
+            c.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
+    c.execute("""CREATE TABLE IF NOT EXISTS tabs (
+        id INTEGER PRIMARY KEY, day_id INTEGER NOT NULL REFERENCES days(id), label TEXT NOT NULL,
+        order_type TEXT NOT NULL DEFAULT 'Dine in', guests INTEGER CHECK (guests IS NULL OR guests BETWEEN 0 AND 500),
+        staff_id INTEGER NOT NULL REFERENCES staff(id),
+        status TEXT NOT NULL CHECK (status IN ('open','paid','cancelled')),
+        opened_at TEXT NOT NULL, closed_at TEXT, order_id INTEGER REFERENCES orders(id),
+        cancel_reason TEXT, cancelled_by INTEGER REFERENCES staff(id), client_ref TEXT)""")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_tab_open_label ON tabs(label COLLATE NOCASE) WHERE status = 'open'")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_tab_client_ref ON tabs(client_ref) WHERE client_ref IS NOT NULL")
+    c.execute("""CREATE TABLE IF NOT EXISTS tab_lines (
+        id INTEGER PRIMARY KEY, tab_id INTEGER NOT NULL REFERENCES tabs(id) ON DELETE CASCADE,
+        menu_item_id INTEGER NOT NULL REFERENCES menu_items(id), qty INTEGER NOT NULL CHECK (qty > 0), note TEXT,
+        added_by INTEGER NOT NULL REFERENCES staff(id), added_at TEXT NOT NULL, batch_ref TEXT, sent_at TEXT,
+        removed_at TEXT, removed_by INTEGER REFERENCES staff(id), removed_reason TEXT, approved_by INTEGER REFERENCES staff(id))""")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_tab_lines_tab ON tab_lines(tab_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_tab_lines_batch ON tab_lines(batch_ref)")
+
+
+def _migrate_to_5(c):
+    """Staff e-mail: links a staff member to a website (Supabase) login in cloud mode."""
+    if "email" not in _cols(c, "staff"):
+        c.execute("ALTER TABLE staff ADD COLUMN email TEXT COLLATE NOCASE")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_staff_email ON staff(email) WHERE email IS NOT NULL")
+
+
+MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4, 5: _migrate_to_5}
 
 
 def init_db():
+    if BACKEND == "postgres":
+        from . import pg
+        pg.init_db(DATABASE_URL, DEFAULT_SETTINGS)
+        return
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = connect()
     try:

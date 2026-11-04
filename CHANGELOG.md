@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.1.0-dev — 2026-11-04 (cloud mode)
+
+INV-POS can now also run in the cloud as the inventory engine behind the CFC website's /dashboard, while MICROS keeps selling. The LAN install is unchanged.
+
+- **Postgres backend** (`DATABASE_URL=postgresql://...`, e.g. Supabase): same queries, translated by `app/pg.py`; schema in `app/schema_pg.sql`, created on first start in its own schema (`INVPOS_PG_SCHEMA`, default `inventory`). Writes are serialised with an advisory lock, giving the same guarantees as SQLite's BEGIN IMMEDIATE. Connection pool, Nairobi time zone per connection.
+- **Inventory-only mode** (`POS_MODULE=off`): till, open checks and cash shifts are switched off (API returns 404, UI hides them); stock, purchasing, days, reports, imports and roles work as before.
+- **Website logins**: with `SUPABASE_URL` set, `Authorization: Bearer <Supabase access token>` is accepted. Signature (JWKS or legacy secret), issuer, audience and expiry are checked, then the e-mail is matched to an active staff member, whose INV-POS role applies. Staff get an optional *Website login e-mail* (Setup → Staff, unique). Schema v5 adds it on SQLite too.
+- **CORS** for the website origins (`CORS_ORIGINS`).
+- Cloud hosts have no lasting disk: the PIN pepper comes from `INVPOS_SECRET` and the licence server id from `INVPOS_SERVER_ID` (cloud mode refuses to start without the secret).
+- `render.yaml` blueprint, `requirements-cloud.txt`, docs/CLOUD.md (Supabase, Render, domain, linking staff, Next.js fetch helper, backups).
+- Two report queries fixed to be valid standard SQL (grouping by name). The results are the same on SQLite.
+- 8 new tests (63 total), and the whole suite also passes on Postgres.
+
+## 1.0.0-rc.1 — 2026-10-29
+
+Release candidate for installation at City Food Court.
+
+**Menu**
+- CFC's full printed menu (`CFC_Menu_Food_and_Drinks.pdf`) as `menus/cfc_menu.csv`: 328 items in 25 categories, 325 on sale, 3 hidden until priced (the only items left for review); where the PDF disagreed with itself the lower price is used. See docs/CFC_MENU.md.
+- Menu CSV import/export (Setup → Import / export and `scripts/load_menu.py`): all-or-nothing, preview, price changes audited, never deletes, optional hide-missing.
+- Option groups (sizes/choices) shown as one tile with a picker; descriptions; sale days (Thursday pizza special enforced on the server); zero-price included accompaniments; per-line notes.
+- `--cfc` profile: VAT 16 % **included** in menu prices (total = menu price, VAT shown inside it), business details, order types incl. Glovo / Uber Eats, resale items linked to stock.
+
+**Open checks (MICROS guest checks)**
+- Servers open a check per table or name, add items over time and *Send* them (kitchen ticket prints); the cashier takes payment later. Pro-forma bill, reprint, hold a counter sale as a check.
+- Removing a sent item or cancelling a check with sent items needs a manager (or manager PIN) and a reason; shown in the Voids report and audit log. The day can't close while checks are open.
+- Employee sales are credited to the server who opened the check; the guest check journal shows table and server.
+
+**Install & polish**
+- `setup.bat` checks Python, builds the venv and offers to load the CFC menu; `scripts/windows/install_tasks.bat` registers server autostart, nightly backup, end-of-day reports and the firewall rule. See docs/INSTALL_WINDOWS.md.
+- Replaces the MICROS "reset": a watchdog task restarts the server automatically if it freezes or stops (checked every 2 minutes), `restart_server.bat` restarts it on demand, and a reloaded till keeps its unsent cart. Plus `reset_admin_pin.bat`.
+- First-run setup checklist on the dashboard; business phone on receipts; 2-decimal money where needed; tablet layout fixes.
+- Schema v4 migration (automatic backup first). 10 new tests (55 total).
+
 ## 0.3.0 — 2026-10-26
 
 Matches the core report set of CFC's current MICROS RES 3700 back office (see docs/MICROS_PARITY.md).

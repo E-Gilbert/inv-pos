@@ -1,20 +1,31 @@
 """Authentication, sessions, permissions, throttling, headers, migration of v0.1 data."""
 import os
 import sqlite3
+from datetime import datetime, timedelta
 
 import app.db as db
 from app.security import hash_pin, hash_token
 from conftest import ing_id, login, menu_ids, open_day, sell
 
 
+def _sql(q, args=()):
+    """Run SQL straight against the test database (SQLite or Postgres)."""
+    with db.tx() as c:
+        cur = c.execute(q, args)
+        return cur.fetchall()
+
+
+def _ts(**delta):
+    return (datetime.now() + timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def test_pins_are_not_stored_in_plain_text(cl):
-    con = sqlite3.connect(os.environ["CFC_DB"])
-    cols = [r[1] for r in con.execute("PRAGMA table_info(staff)")]
+    cols = _sql("SELECT * FROM staff LIMIT 1")[0].keys()
     assert "pin" not in cols and "pin_hash" in cols
-    hashes = [r[0] for r in con.execute("SELECT pin_hash FROM staff")]
+    hashes = [r[0] for r in _sql("SELECT pin_hash FROM staff")]
     assert "1234" not in hashes and hash_pin("1234") in hashes
     t = login(cl, "1111")["X-Token"]
-    tokens = [r[0] for r in con.execute("SELECT token_hash FROM sessions")]
+    tokens = [r[0] for r in _sql("SELECT token_hash FROM sessions")]
     assert t not in tokens and hash_token(t) in tokens
 
 
@@ -36,19 +47,15 @@ def test_unauthenticated_and_bad_tokens(cl):
 
 def test_session_expiry(cl):
     h = login(cl, "1111")
-    con = sqlite3.connect(os.environ["CFC_DB"])
     # activity slides the idle timeout forward, capped at 24 h after login
-    con.execute("UPDATE sessions SET expires_at = datetime('now','localtime','+1 minute')")
-    con.commit()
+    _sql("UPDATE sessions SET expires_at = ?", (_ts(minutes=1),))
     assert cl.get("/api/state", headers=h).status_code == 200
-    assert con.execute("SELECT expires_at > datetime('now','localtime','+60 minutes') FROM sessions").fetchone()[0] == 1
-    con.execute("UPDATE sessions SET created_at = datetime('now','localtime','-25 hours')")
-    con.commit()
+    assert _sql("SELECT expires_at FROM sessions")[0][0] > _ts(minutes=60)
+    _sql("UPDATE sessions SET created_at = ?", (_ts(hours=-25),))
     cl.get("/api/state", headers=h)  # recomputed expiry is already in the past (hard cap)
     assert cl.get("/api/state", headers=h).status_code == 401
     h = login(cl, "1111")
-    con.execute("UPDATE sessions SET expires_at = '2000-01-01 00:00:00'")
-    con.commit()
+    _sql("UPDATE sessions SET expires_at = '2000-01-01 00:00:00'")
     assert cl.get("/api/state", headers=h).status_code == 401
 
 
@@ -75,9 +82,7 @@ def test_permission_matrix(cl):
 
 
 def test_first_run_admin_must_change_pin(cl, monkeypatch):
-    con = sqlite3.connect(os.environ["CFC_DB"])
-    con.execute("UPDATE staff SET must_change_pin = 1 WHERE role = 'admin'")
-    con.commit()
+    _sql("UPDATE staff SET must_change_pin = 1 WHERE role = 'admin'")
     A = login(cl, "1234")
     assert cl.get("/api/staff", headers=A).status_code == 403
     assert cl.get("/api/state", headers=A).json()["staff"]["must_change_pin"]
@@ -140,6 +145,7 @@ def test_migration_from_v01_database(tmp_path, monkeypatch):
     """)
     con.commit()
     con.close()
+    monkeypatch.setattr(db, "BACKEND", "sqlite")  # this test is about upgrading old SQLite files
     monkeypatch.setattr(db, "DB_PATH", str(path))
     monkeypatch.setattr(db, "DATA_DIR", str(tmp_path))
     db.init_db()

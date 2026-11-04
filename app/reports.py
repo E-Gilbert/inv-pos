@@ -86,8 +86,9 @@ def period_of(hhmm, periods):
 
 def _orders(c, ids, status="paid"):
     return c.execute(
-        f"""SELECT o.*, d.business_date, s.name AS cashier FROM orders o
+        f"""SELECT o.*, d.business_date, s.name AS cashier, sv.name AS server FROM orders o
             JOIN days d ON d.id = o.day_id JOIN staff s ON s.id = o.staff_id
+            LEFT JOIN staff sv ON sv.id = COALESCE(o.server_id, o.staff_id)
             WHERE o.day_id IN ({_ph(ids)}) AND o.status = ? ORDER BY d.business_date, o.number""",
         ids + [status]).fetchall()
 
@@ -369,12 +370,13 @@ def rpt_cashier(c, ids):
 
 def rpt_guest_checks(c, ids):
     rows = c.execute(
-        f"""SELECT o.*, d.business_date, s.name AS cashier,
+        f"""SELECT o.*, d.business_date, s.name AS cashier, sv.name AS server, t.label AS tab_label,
                    (SELECT GROUP_CONCAT(qty || '× ' || name, ', ') FROM order_items WHERE order_id = o.id) AS items
             FROM orders o JOIN days d ON d.id = o.day_id JOIN staff s ON s.id = o.staff_id
+            LEFT JOIN staff sv ON sv.id = COALESCE(o.server_id, o.staff_id) LEFT JOIN tabs t ON t.id = o.tab_id
             WHERE o.day_id IN ({_ph(ids)}) ORDER BY d.business_date, o.number LIMIT 5000""", ids).fetchall()
     out = [{"date": r["business_date"], "number": r["number"], "time": r["created_at"][11:16], "cashier": r["cashier"],
-            "type": r["order_type"], "guests": r["guests"], "items": r["items"], "subtotal": r["subtotal"] or r["total"],
+            "server": r["server"], "table": r["tab_label"] or "", "type": r["order_type"], "guests": r["guests"], "items": r["items"], "subtotal": r["subtotal"] or r["total"],
             "discount": r["discount"], "tax": r["tax"], "total": r["total"],
             "payment": {"cash": "Cash", "mpesa": "M-Pesa", "card": "Card"}[r["payment_method"]] + (f" {r['payment_ref']}" if r["payment_ref"] else ""),
             "status": "VOID" if r["status"] == "void" else ("part refunded" if 0 < (r["refunded"] or 0) < r["total"] else
@@ -385,8 +387,8 @@ def rpt_guest_checks(c, ids):
            "discount": sum(dec(r["discount"]) for r in paid), "tax": sum(dec(r["tax"]) for r in paid),
            "total": sum(dec(r["total"]) for r in paid), "refunded": sum(dec(r["refunded"]) for r in paid)}
     keys = ["subtotal", "discount", "tax", "total", "refunded"]
-    cols = [col("date", "Date"), col("number", "Check #"), col("time", "Time"), col("cashier", "Cashier"), col("type", "Type"),
-            col("guests", "Guests", INT), col("items", "Items"), col("subtotal", "Gross", MONEY), col("discount", "Discount", MONEY),
+    cols = [col("date", "Date"), col("number", "Check #"), col("time", "Paid"), col("table", "Table / name"), col("server", "Server"),
+            col("cashier", "Cashier"), col("type", "Type"), col("guests", "Guests", INT), col("items", "Items"), col("subtotal", "Gross", MONEY), col("discount", "Discount", MONEY),
             col("tax", "Tax", MONEY), col("total", "Total", MONEY), col("payment", "Payment"), col("status", "Status"),
             col("refunded", "Refunded", MONEY)]
     return [{"title": "Guest check journal", "columns": cols, "rows": _finish(out, keys), "totals": _finish([tot], keys)[0],
@@ -406,7 +408,7 @@ def rpt_employee(c, ids):
     names = {r["id"]: r["name"] for r in c.execute("SELECT id, name FROM staff")}
     by_type = OrderedDict()
     for o in orders:
-        a = s(o["cashier"])
+        a = s(o["server"])
         a["checks"] += 1
         a["guests"] += o["guests"] or 0
         a["gross"] += dec(o["subtotal"] or o["total"])
@@ -415,14 +417,14 @@ def rpt_employee(c, ids):
         a["collected"] += dec(o["total"])
         if o["discount"] and o["discount_by"]:
             s(names.get(o["discount_by"], "?"))["disc_approved"] += dec(o["discount"])
-        t = by_type.setdefault((o["cashier"], o["order_type"]), {"employee": o["cashier"], "type": o["order_type"], "checks": 0,
+        t = by_type.setdefault((o["server"], o["order_type"]), {"employee": o["server"], "type": o["order_type"], "checks": 0,
                                                                   "guests": 0, "net": Decimal(0), "collected": Decimal(0)})
         t["checks"] += 1
         t["guests"] += o["guests"] or 0
         t["net"] += _ex_tax(o)
         t["collected"] += dec(o["total"])
     for o in voids:
-        a = s(o["cashier"])
+        a = s(o["server"])
         a["voids"] += 1
         a["void_amt"] += dec(o["total"])
     for r in refunds:
@@ -444,7 +446,8 @@ def rpt_employee(c, ids):
     t_rows = _finish([dict(t, avg=t["collected"] / t["checks"]) for t in by_type.values()], ["net", "collected", "avg"])
     return [
         {"title": "Employee sales", "columns": cols, "rows": _finish(rows, keys), "totals": _finish([tot], keys)[0],
-         "note": "Voids are counted against the person who rang the check; refunds against the person who gave them."},
+         "note": "Sales and voids belong to the check's server (the person who opened the check, or rang it at the till); "
+                 "refunds to the person who gave them. Cash handling is in the cashier report."},
         {"title": "Employee by order type", "columns": [col("employee", "Employee"), col("type", "Order type"), col("checks", "Checks", INT),
                                                        col("guests", "Guests", INT), col("net", "Net sales", MONEY),
                                                        col("collected", "Collected", MONEY), col("avg", "Avg check", MONEY)],
@@ -548,11 +551,22 @@ def rpt_voids(c, ids):
     cols = [col("date", "Date"), col("number", "Check #"), col("time", "Rung at"), col("cashier", "Rung by"), col("by", "Voided by"),
             col("reason", "Reason"), col("items", "Items"), col("total", "Amount", MONEY)]
     tot = {"date": "Total", "number": f"{len(out)} checks", "total": sum((dec(r["total"]) for r in out), Decimal(0))}
+    from .tabs import item_voids
+    iv = item_voids(c, ids)
+    iv_rows = [{"date": r["business_date"], "table": r["label"], "time": r["removed_at"][11:16], "item": f"{r['qty']}× {r['item']}",
+                "server": r["server"], "by": r["removed_by"] or "", "approved": r["approved_by"] or "", "reason": r["reason"] or "",
+                "value": r["value"]} for r in iv]
+    iv_tot = {"date": "Total", "table": f"{len(iv_rows)} items", "value": sum((dec(r["value"]) for r in iv_rows), Decimal(0))}
     return [
         {"title": "Voids by reason", "columns": [col("reason", "Reason"), col("count", "Checks", INT), col("total", "Amount", MONEY)],
          "rows": _finish(sorted(by.values(), key=lambda b: -b["total"]), ["total"]), "totals": None},
         {"title": "Void detail", "columns": cols, "rows": _finish(out, ["total"]), "totals": _finish([tot], ["total"])[0],
          "note": "Voids cancel a whole check on the same day and put its ingredients back in stock."},
+        {"title": "Item voids on open checks (sent to kitchen, removed before payment)",
+         "columns": [col("date", "Date"), col("table", "Check"), col("time", "Removed"), col("item", "Item"), col("server", "Server"),
+                     col("by", "Removed by"), col("approved", "Approved by"), col("reason", "Reason"), col("value", "Value", MONEY)],
+         "rows": _finish(iv_rows, ["value"]), "totals": _finish([iv_tot], ["value"])[0],
+         "note": "Not sales: these items never reached a paid check, but the kitchen had already prepared them."},
     ], []
 
 
