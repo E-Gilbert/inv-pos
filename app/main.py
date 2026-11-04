@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import importer, licence, logic, reports, tabs, webauth, workbook
+from . import analytics, importer, licence, logic, reports, tabs, webauth, workbook
 from .db import BASE_DIR, DATA_DIR, DEFAULT_SETTINGS, audit, get_setting, init_db, now, setting_float, tx
 from .logic import Conflict, RuleError
 from .security import (POS_PERMISSIONS, allowed, hash_pin, hash_token, new_token, permissions_for, pos_enabled,
@@ -300,6 +300,14 @@ def dashboard(staff=Depends(need("stock.view"))):
             out["open_pos"] = c.execute("SELECT COUNT(*) FROM purchase_orders WHERE status IN ('ordered','partial')").fetchone()[0]
             out["valuation"] = logic.money(sum(o["value"] for o in overview if o["active"]))
         return out
+
+
+@app.get("/api/analytics")
+def analytics_view(days: int = Query(30, ge=1, le=366), staff=Depends(need("stock.view"))):
+    """Usage, purchases, waste, shortages, cover and plain-language findings for the dashboards.
+    Values (KES) only for roles that may see costs."""
+    with tx() as c:
+        return analytics.build(c, days, include_money=allowed(staff["role"], "reports.view"))
 
 
 # ---------------------------------------------------------------- POS
@@ -1215,6 +1223,7 @@ class Settings(BaseModel):
     order_types: str = Field(default="Dine in,Takeaway,Delivery", min_length=1, max_length=200)
     ask_guests: bool = False
     serving_periods: str = Field(default=DEFAULT_SETTINGS["serving_periods"], max_length=300)
+    auto_open_day: bool = False
 
     @field_validator("order_types")
     @classmethod
@@ -1289,8 +1298,8 @@ async def excel_import(file: UploadFile = File(...), preview: bool = Query(False
     """Ingredients + recipes template (.xlsx) or ingredients .csv. preview=true checks everything and saves nothing."""
     data = await _read_upload(file)
     name = (file.filename or "").lower()
-    if not name.endswith(".csv") and workbook.is_stock_movement_workbook(data):
-        raise HTTPException(400, "This looks like a daily stock-movement workbook. Use 'Import stock history' instead.")
+    if (not name.endswith(".csv") and workbook.is_stock_movement_workbook(data)) or workbook.is_table(data, name):
+        raise HTTPException(400, "This looks like a daily stock-movement workbook or records file. Use 'Import stock history' instead.")
     try:
         with tx() as c:  # any error rolls back the whole import
             stats = importer.import_ingredients_csv(c, data) if name.endswith(".csv") else importer.import_workbook(c, data)
@@ -1362,31 +1371,48 @@ def setup_status(staff=Depends(need("reports.view"))):
 @app.post("/api/import/stock-workbook")
 async def stock_workbook(file: UploadFile = File(...), mapping: str = Form(""), commit: bool = Query(False),
                          year: Optional[int] = Query(None, ge=2000, le=2100), month: Optional[int] = Query(None, ge=1, le=12),
+                         auto_units: bool = Query(False), open_day: bool = Query(False),
                          staff=Depends(need("data.import"))):
-    """Daily stock-movement workbook. Without commit: returns the analysis (items, unit suggestions,
-    discrepancies) and saves nothing. With commit + confirmed units: imports as closed history days."""
+    """Stock records for past days: CFC's workbook (one sheet per day) or a flat table (CSV, or one Excel
+    sheet with a date column). Without commit: returns the analysis (items, units, discrepancies) and
+    saves nothing. With commit: imports them as closed history days. auto_units fills units from the
+    file, existing items or safe suggestions; open_day then opens today with the last closing carried over."""
     data = await _read_upload(file)
     try:
-        parsed = workbook.parse(data, file.filename or "", year, month)
+        parsed = workbook.parse_any(data, file.filename or "", year, month)
     except Exception as e:
-        raise ValueError("Couldn't read that workbook. Is it a valid .xlsx file?") from e
+        raise ValueError("Couldn't read that file. Is it a valid .xlsx or .csv?") from e
+    try:
+        m = json.loads(mapping or "{}")
+    except ValueError:
+        m = None
+    if not isinstance(m, dict) or not all(isinstance(v, dict) for v in m.values()):
+        raise HTTPException(400, "Unit mapping is not valid.")
     with tx() as c:
-        existing = {r["name"].lower(): dict(r) for r in c.execute("SELECT id, name, unit FROM ingredients")}
         dup = c.execute("SELECT created_at FROM import_batches WHERE kind='stock_history' AND sha256=?", (parsed["sha256"],)).fetchone()
+        plan = importer.resolve_units(c, parsed, m, auto_units)
         for it in parsed["items"]:
-            it["existing"] = existing.get(it["key"])
+            p = plan[it["key"]]
+            it["existing"] = p["existing"]
+            it["resolved_unit"], it["unit_source"] = p["unit"], p["source"]
         if not commit:
+            dates = [d for s_ in parsed["sheets"] for d in s_["dates"]]
+            later = c.execute("SELECT business_date FROM days WHERE COALESCE(covers_to, business_date) >= ? ORDER BY business_date LIMIT 1",
+                              (dates[0],)).fetchone() if dates else None
             return {"commit": False, "already_imported": dup["created_at"] if dup else None,
+                    "format": parsed.get("format"), "columns": parsed.get("columns", []),
                     "year": parsed["year"], "month": parsed["month"], "items": parsed["items"], "issues": parsed["issues"],
-                    "counts": parsed["counts"],
+                    "counts": parsed["counts"], "first_date": dates[0] if dates else None, "last_date": dates[-1] if dates else None,
+                    "open_day_exists": bool(logic.open_day_row(c)), "conflict_date": later["business_date"] if later else None,
+                    "needs_unit": [it["item"] for it in parsed["items"] if not it["resolved_unit"]],
                     "sheets": [{"name": s["name"], "dates": s["dates"], "rows": len(s["rows"])} for s in parsed["sheets"]]}
-        try:
-            m = json.loads(mapping or "{}")
-        except ValueError:
-            m = None
-        if not isinstance(m, dict) or not all(isinstance(v, dict) for v in m.values()):
-            raise HTTPException(400, "Unit mapping is not valid.")
-        summary = importer.import_history(c, parsed, m, staff["id"], file.filename)
+        summary = importer.import_history(c, parsed, m, staff["id"], file.filename, auto_units=auto_units)
+        summary["opened_day"] = None
+        if open_day and not logic.open_day_row(c):
+            today = logic.business_today()
+            if today > summary["last_date"]:
+                day_id = logic.open_day(c, staff["id"], today)
+                summary["opened_day"] = {"id": day_id, "business_date": today}
     return {"commit": True, **summary}
 
 

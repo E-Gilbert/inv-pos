@@ -34,3 +34,5 @@ services:
         value: https://cityfoodcourt.co.ke,https://www.cityfoodcourt.co.ke
       - key: INVPOS_PG_POOL
         value: "3"
+      - key: INVPOS_AUTO_OPEN_DAY  # first stock entry of a new day opens it with last night's closing
+        value: "1"

@@ -183,6 +183,8 @@ DEFAULT_SETTINGS = {
     "ask_guests": "0",
     "serving_periods": "Breakfast=05:00-11:00;Lunch=11:00-16:00;Dinner=16:00-05:00",
     "business_phone": "",
+    # 1 = the first stock entry of a new day opens it with last night's closing carried over.
+    "auto_open_day": "1" if os.environ.get("INVPOS_AUTO_OPEN_DAY", "").strip() == "1" else "0",
 }
 
 

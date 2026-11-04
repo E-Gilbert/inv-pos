@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0-dev — 2026-11-04 (records import, analytics, CFC branding)
+
+- **Past records in any common layout.** Setup → Import, and the first *Open day* screen, read CFC's workbook (one sheet per day) or a flat table (CSV, or one Excel sheet with a date column). Column names are recognised from common variants (received / purchases / delivered, closing / count, sales / sold, waste, unit, unit cost, remarks…); dates in 03/11/2026, 2026-11-03, 3 Nov 2026 or real Excel dates; comma, semicolon or tab separated. A blank opening is taken from the item's previous closing.
+- **Units without typing.** With `auto_units`, each item's unit comes from the file's unit column, the matching stock item, or the numbers and name; only items that can't be told apart are asked about. Unit costs in the file set the cost of items that have none.
+- **Import and open today.** `open_day=true` opens today straight after the import with the last closing carried over.
+- Data findings in imported files (carry-over breaks, formula mismatches, closing above opening + received) are now warnings that are imported as recorded; only structural problems (unreadable dates, text in number cells, duplicate rows, missing closing) block an import.
+- **Automatic day opening** (Settings → Opening the day, or `INVPOS_AUTO_OPEN_DAY=1`): the first stock entry of a new day opens it with last night's closing. Closing still needs the count.
+- An item with no purchase cost takes the first price it is received at, under every costing method.
+- **Analytics** (`GET /api/analytics?days=7|30|90`): stock used / received / wasted / short per day, waste by reason, biggest shortages, most used, purchases by supplier, value by category, days of cover, and short findings. Values only for roles that see costs.
+- **Dashboard** rebuilt on it: period switch, KPIs, daily chart, findings, stock health, runs-out-soonest, shortage / waste / usage / supplier breakdowns. No external libraries.
+- **City Food Court look**: charcoal and gold theme, Playfair Display and Lato served from the app (no internet needed), CFC logo on the PIN screen, header and app icons. Receipts still print black on white.
+- 7 new tests (71 total).
+
 ## 1.1.0-dev — 2026-11-04 (cloud mode)
 
 INV-POS can now also run in the cloud as the inventory engine behind the CFC website's /dashboard, while MICROS keeps selling. The LAN install is unchanged.

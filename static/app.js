@@ -158,11 +158,12 @@ function renderLogin() {
   let pin = "";
   $app.innerHTML = `
     <div class="login"><div class="card">
+      <img class="logo" src="/static/logo.png" alt="">
       <h1>${esc(S.state?.business_name || "City Food Court")}</h1><div class="muted">Enter your PIN</div>
       <div class="pin-dots" id="dots" aria-live="polite"></div>
       <div class="pinpad">
         ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}" aria-label="${n}">${n}</button>`).join("")}
-        <button data-k="clr" aria-label="Clear">C</button><button data-k="0" aria-label="0">0</button><button data-k="ok" aria-label="OK" style="background:var(--brand);color:#fff">OK</button>
+        <button data-k="clr" aria-label="Clear">C</button><button data-k="0" aria-label="0">0</button><button data-k="ok" aria-label="OK" class="ok">OK</button>
       </div>
       <div class="err" id="err" role="alert"></div>
     </div></div>`;
@@ -242,21 +243,24 @@ function licenceBanner() {
 
 function render() {
   const day = S.state.day;
+  document.title = `${S.state.business_name || "City Food Court"} · ${S.state.modules?.pos === false ? "Inventory" : "POS"}`;
   if (!VIEWS.find((v) => v[0] === S.view && v[2]())) S.view = (VIEWS.find((v) => v[2]()) || ["dash"])[0];
   const sh = S.state.shift;
   $app.innerHTML = `
     <header class="top">
-      <div class="brand">${esc(S.state.business_name)}</div>
+      <div class="brand"><img src="/static/logo.png" alt="">${esc(S.state.business_name)}</div>
       <nav aria-label="Main">${VIEWS.filter((v) => v[2]()).map(([k, l]) => `<button data-v="${k}" class="${S.view === k ? "active" : ""}">${l}</button>`).join("")}</nav>
       <div class="who">
-        ${can("shift.own") && day ? `<button id="shiftbtn" title="Cash shift">${sh ? "Shift ✓" : "Open shift"}</button>` : ""}
+        ${can("shift.own") && day ? `<button id="shiftbtn" title="Cash shift">${sh ? "Shift open" : "Open shift"}</button>` : ""}
         <span>${esc(S.staff.name)} · ${esc(S.staff.role.replace("_", " "))}</span>
         <button id="pinbtn" title="Change PIN">PIN</button><button id="logout">Log out</button></div>
     </header>
     ${licenceBanner()}
     <div class="daybar ${day ? "open" : "closed"}">
       ${day ? `<b>Day open:</b> ${esc(day.business_date)} <span class="muted small">since ${esc(day.opened_at?.slice(11, 16) || "")}</span>`
-            : `<b>No day open.</b> ${S.state.modules?.pos === false ? "Stock entries are" : "Sales and stock entries are"} locked until a manager opens the day.
+            : S.state.settings?.auto_open_day === "1" && !S.state.first_day
+              ? `<b>No day open.</b> Today opens automatically with the first stock entry, using last night's closing count.`
+              : `<b>No day open.</b> ${S.state.modules?.pos === false ? "Stock entries are" : "Sales and stock entries are"} locked until a manager opens the day.
                ${can("day.manage") ? `<button class="btn" id="goopen">Open day</button>` : ""}`}
     </div>
     <main id="view"></main>`;
@@ -282,48 +286,114 @@ function globalKeys(e) {
 }
 
 // ------------------------------------------------------------------ dashboard
+// Everything here is derived from records already in the system (/api/analytics); nothing is typed in.
+const kmoney = (n) => {
+  const v = Number(n || 0), a = Math.abs(v);
+  return cur() + " " + (a >= 1e6 ? (v / 1e6).toFixed(1) + "M" : a >= 1e4 ? Math.round(v / 1e3) + "k" : a >= 1e3 ? (v / 1e3).toFixed(1) + "k" : Math.round(v).toLocaleString("en-KE"));
+};
+const niceMax = (v) => { if (v <= 0) return 1; const p = 10 ** Math.floor(Math.log10(v)); return Math.ceil(v / p / (v / p > 5 ? 2 : 1)) * p * (v / p > 5 ? 2 : 1); };
+
+/** Columns (received) with a line and soft area (used) and a dashed line (shortages), one point per day. */
+function dailyChart(daily, withMoney) {
+  if (!daily.length) return `<div class="empty">No days recorded in this period yet.</div>`;
+  const W = 680, H = 230, L = 52, R = 8, T = 10, B = 26, n = daily.length;
+  const val = (d, k) => (withMoney ? d[k] || 0 : 0);
+  const a = withMoney ? daily.map((d) => val(d, "usage_value")) : daily.map((d) => d.items_short);
+  const b = withMoney ? daily.map((d) => val(d, "delivered_value")) : [];
+  const c = withMoney ? daily.map((d) => val(d, "shortage_value")) : [];
+  const max = niceMax(Math.max(1, ...a, ...b, ...c));
+  const x = (i) => L + (n === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (n - 1));
+  const y = (v) => T + (H - T - B) * (1 - v / max);
+  const bw = Math.max(2, Math.min(22, ((W - L - R) / n) * 0.55));
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => max * f);
+  const every = Math.ceil(n / 10);
+  const path = (arr) => arr.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+  const imported = daily.map((d, i) => (d.source === "workbook" ? `<rect class="imp" x="${(x(i) - bw).toFixed(1)}" y="${T}" width="${(bw * 2).toFixed(1)}" height="${H - T - B}"/>` : "")).join("");
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${withMoney ? "Stock used and received per day" : "Items short per day"}">
+    ${ticks.map((t) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}"/><text x="${L - 6}" y="${y(t) + 4}" text-anchor="end">${withMoney ? kmoney(t).replace(cur() + " ", "") : Math.round(t)}</text>`).join("")}
+    ${imported}
+    ${b.map((v, i) => `<rect class="s2" x="${(x(i) - bw / 2).toFixed(1)}" y="${y(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, H - B - y(v)).toFixed(1)}" rx="2"><title>${esc(daily[i].date)} received ${money(v)}</title></rect>`).join("")}
+    ${withMoney ? `<path class="s1a" d="${path(a)}L${x(n - 1)},${H - B}L${x(0)},${H - B}Z"/><path class="s1l" d="${path(a)}"/><path class="s3l" d="${path(c)}"/>`
+                : a.map((v, i) => `<rect class="s1" x="${(x(i) - bw / 2).toFixed(1)}" y="${y(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, H - B - y(v)).toFixed(1)}" rx="2"><title>${esc(daily[i].date)}: ${v} items short</title></rect>`).join("")}
+    ${withMoney ? a.map((v, i) => `<circle class="s1" cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${n > 40 ? 0 : 2.5}"><title>${esc(daily[i].date)} used ${money(v)}${c[i] ? ", short " + money(c[i]) : ""}</title></circle>`).join("") : ""}
+    <line class="axis" x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}"/>
+    ${daily.map((d, i) => (i % every === 0 || i === n - 1 ? `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">${esc(d.date.slice(8))}</text>` : "")).join("")}
+  </svg>
+  <div class="legend">${withMoney ? `<span class="k"><i style="background:var(--brand)"></i>Used</span><span class="k"><i style="background:#7d7564"></i>Received</span>
+    <span class="k"><i style="background:var(--red)"></i>Shortages</span>` : `<span class="k"><i style="background:var(--brand)"></i>Items short</span>`}
+    ${daily.some((d) => d.source === "workbook") ? `<span class="k"><i style="background:rgba(255,255,255,.12)"></i>Imported records</span>` : ""}</div>`;
+}
+
+function hbars(rows, label, value, cls = "") {
+  if (!rows.length) return `<div class="muted small">Nothing recorded in this period.</div>`;
+  const max = Math.max(...rows.map(value), 1e-9);
+  return `<div class="hbars">${rows.map((r) => `<div class="hbar ${cls}"><span class="n" title="${esc(label(r))}">${esc(label(r))}</span>
+    <span class="t"><span style="width:${Math.max(2, (value(r) / max) * 100).toFixed(1)}%"></span></span><span class="v">${r._v}</span></div>`).join("")}</div>`;
+}
+
 async function viewDashboard(el) {
+  S.dashDays = S.dashDays || 30;
+  const closedOnly = (rows) => rows.filter((x) => x.status === "closed");
   el.innerHTML = `<div class="empty">Loading…</div>`;
-  let d;
-  try { d = await api("/api/dashboard"); } catch (e) { el.innerHTML = ""; return fail(e); }
-  const c = d.stock_counts;
+  let d, a;
+  try { [d, a] = await Promise.all([api("/api/dashboard"), api(`/api/analytics?days=${S.dashDays}`)]); } catch (e) { el.innerHTML = ""; return fail(e); }
+  const c = d.stock_counts, m = a.money, t = a.totals, posOn = S.state.modules?.pos !== false;
   const card = (cls, v, l, f) => `<button class="statcard ${cls}" data-f="${f}"><div class="v">${v}</div><div class="small">${l}</div></button>`;
-  const t = d.today;
-  const maxTrend = Math.max(1, ...(d.trend || []).map((x) => x.sales));
+  const kpi = (l, v, sub = "") => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div>${sub ? `<div class="d">${sub}</div>` : ""}</div>`;
+  const qty = (r) => fmtQty(r.qty, r.unit);
+  const total = Object.values(a.status_counts).reduce((x, y) => x + y, 0) || 1;
+  const seg = [["red", c.out + c.critical], ["amber", c.low], ["green", c.healthy], ["grey", c.inactive]];
+  const coverBar = (x) => { const p = Math.min(100, (x.days_left / 14) * 100); const col = x.days_left <= 2 ? "var(--red)" : x.days_left <= 5 ? "var(--amber)" : "var(--green)"; return `<div class="t"><span style="width:${Math.max(3, p)}%;background:${col}"></span></div>`; };
+  const td = d.today;
   el.innerHTML = `
+    <div class="dash-head"><h2>Overview</h2>
+      <div class="seg" role="group" aria-label="Period">${[7, 30, 90].map((n) => `<button data-days="${n}" class="${S.dashDays === n ? "active" : ""}">${n} days</button>`).join("")}</div></div>
     <div id="setupck"></div>
-    ${t ? `<div class="kpis">
-      <div class="kpi"><div class="l">Sales today (collected)</div><div class="v">${money(t.collected - t.refunds)}</div></div>
-      <div class="kpi"><div class="l">Orders</div><div class="v">${t.orders}</div></div>
-      <div class="kpi"><div class="l">Gross profit (est.)</div><div class="v">${money(t.gross_profit)}</div></div>
-      <div class="kpi"><div class="l">Stock value</div><div class="v">${money(d.valuation)}</div></div>
-    </div>` : ""}
-    <h3>Stock status</h3>
-    <div class="statcards">
-      ${card("red", c.out + c.critical, "Critical / out of stock", "red")}
-      ${card("amber", c.low, "Low stock", "amber")}
-      ${card("green", c.healthy, "Healthy", "green")}
-      ${card("blue", d.incoming_items, "Incoming (ordered)", "blue")}
-      ${card("grey", c.inactive, "Inactive", "grey")}
+    ${posOn && td ? `<div class="kpis">${kpi("Sales today (collected)", money(td.collected - td.refunds))}${kpi("Orders today", td.orders)}${kpi("Gross profit today (est.)", money(td.gross_profit))}</div>` : ""}
+    <div class="kpis">
+      ${m ? kpi("Stock value now", money(t.stock_value), `${a.coverage.costed} of ${a.coverage.items} items costed`) : kpi("Active items", a.coverage.items)}
+      ${m ? kpi(`Used, last ${S.dashDays} days`, kmoney(t.usage_value), `${t.days_recorded} days recorded`) : kpi("Days recorded", t.days_recorded)}
+      ${m ? kpi("Received", kmoney(t.delivered_value)) : ""}
+      ${m ? kpi("Waste", kmoney(t.waste_value), t.waste_pct_of_usage != null ? `${t.waste_pct_of_usage}% of stock used` : "") : ""}
+      ${m ? kpi("Shortages", kmoney(t.shortage_value), t.shortage_pct_of_usage != null ? `${t.shortage_pct_of_usage}% of stock used` : "") : ""}
     </div>
-    <div class="grid2">
-      <div class="panel"><h3>Needs attention</h3>
-        ${d.alerts.length ? `<div class="tablewrap"><table><thead><tr><th>Item</th><th>Status</th><th class="num">On hand</th><th class="num">Reorder at</th><th class="num">Suggested order</th></tr></thead><tbody>
-          ${d.alerts.map((a) => `<tr class="st-row-${STATUS_COLOUR[a.status]}"><td>${esc(a.name)}</td><td>${stBadge(a.status)} ${incomingBadge(a.incoming, a.unit)}</td>
-            <td class="num">${fmtQty(a.on_hand, a.unit)}</td><td class="num">${fmtQty(a.par_level, a.unit)}</td>
-            <td class="num">${a.suggested_order != null ? fmtQty(a.suggested_order, a.unit) : `<span class="muted small">needs 3+ days of history</span>`}</td></tr>`).join("")}
-        </tbody></table></div>` : `<div class="muted">Nothing is low. 👍</div>`}
-      </div>
-      <div class="panel">
-        ${d.trend ? `<h3>Sales, recent days</h3><div class="bars" aria-label="Sales by day">${d.trend.map((x) =>
-          `<div style="height:${Math.round((x.sales / maxTrend) * 100)}%" title="${esc(x.business_date)}: ${money(x.sales)}${x.source === "workbook" ? " (imported – sold on the other POS)" : ""}"><span>${esc(x.business_date.slice(8))}</span></div>`).join("")}</div>
-          <div class="small muted" style="margin-top:22px">Imported workbook days show 0: those sales were rung up on the other POS.</div>` : ""}
-        ${d.open_shifts ? `<h3 style="margin-top:14px">Open cash shifts</h3>${d.open_shifts.length ? `<table><tbody>${d.open_shifts.map((s) =>
-          `<tr><td>${esc(s.staff_name)}</td><td class="small muted">since ${esc(s.opened_at.slice(11, 16))}</td><td class="num">${money(s.expected_cash_now)} expected in drawer</td></tr>`).join("")}</tbody></table>` : `<div class="muted">None</div>`}` : ""}
-        ${d.open_pos != null ? `<div class="small muted" style="margin-top:10px">${d.open_pos} purchase order(s) waiting for delivery.</div>` : ""}
-      </div>
+    <div class="grid3">
+      <div class="panel"><h3>${m ? "Stock used and received per day" : "Items short per day"}</h3>${dailyChart(closedOnly(a.daily), m)}</div>
+      <div class="panel"><h3>Findings</h3>${a.insights.length ? `<ul class="insights">${a.insights.map((i) => `<li class="${i.level}">${esc(i.text)}</li>`).join("")}</ul>` : `<div class="muted small">Nothing needs attention.</div>`}</div>
+    </div>
+    <div class="grid2 dashgrid" style="margin-top:14px">
+      <div class="panel"><h3>Stock health</h3>
+        <div class="stack" aria-hidden="true">${seg.map(([k, v]) => (v ? `<span style="width:${(v / total) * 100}%;background:var(--${k})"></span>` : "")).join("")}</div>
+        <div class="statcards" style="margin-bottom:0">
+          ${card("red", c.out + c.critical, "Critical / out", "red")}${card("amber", c.low, "Low", "amber")}
+          ${card("green", c.healthy, "Healthy", "green")}${card("blue", d.incoming_items, "On order", "blue")}</div></div>
+      <div class="panel"><h3>Runs out soonest</h3>
+        ${a.cover.length ? `<div class="tablewrap"><table class="cover"><thead><tr><th>Item</th><th class="num">On hand</th><th class="num">Daily use</th><th class="num">Days left</th><th></th></tr></thead><tbody>
+          ${a.cover.slice(0, 8).map((x) => `<tr><td>${esc(x.name)}${x.incoming ? ` <span class="st blue">on order</span>` : ""}</td><td class="num">${fmtQty(x.on_hand, x.unit)}</td>
+            <td class="num">${fmtQty(x.avg_daily_usage, x.unit)}</td><td class="num">${x.days_left}</td><td>${coverBar(x)}</td></tr>`).join("")}</tbody></table></div>`
+          : `<div class="muted small">Shows once items have three or more closed days of counts.</div>`}</div>
+    </div>
+    <div class="grid2 dashgrid" style="margin-top:14px">
+      <div class="panel"><h3>Biggest shortages</h3>${hbars(a.shortages.slice(0, 8).map((r) => ({ ...r, _v: m && r.value ? kmoney(r.value) : qty(r) })), (r) => r.name, (r) => (m && r.value ? r.value : r.qty), "bad")}</div>
+      <div class="panel"><h3>Waste by reason</h3>${hbars(a.waste_by_reason.map((r) => ({ ...r, _v: m && r.value ? kmoney(r.value) : `${r.entries} ${r.entries === 1 ? "entry" : "entries"}` })), (r) => r.reason, (r) => (m && r.value ? r.value : r.entries))}</div>
+    </div>
+    <div class="grid2 dashgrid" style="margin-top:14px">
+      <div class="panel"><h3>Most used</h3>${hbars(a.top_usage.slice(0, 8).map((r) => ({ ...r, _v: m && r.value ? kmoney(r.value) : qty(r) })), (r) => r.name, (r) => (m && r.value ? r.value : r.qty))}</div>
+      ${m ? `<div class="panel"><h3>Purchases by supplier</h3>${hbars(a.suppliers.map((r) => ({ ...r, _v: kmoney(r.value) })), (r) => r.name, (r) => r.value)}
+        ${a.categories.length > 1 ? `<h3 style="margin-top:16px">Stock value by category</h3>${hbars(a.categories.map((r) => ({ ...r, _v: kmoney(r.value) })), (r) => r.name, (r) => r.value)}` : ""}</div>` : ""}
+    </div>
+    <div class="panel" style="margin-top:14px"><h3>Needs attention</h3>
+      ${d.alerts.length ? `<div class="tablewrap"><table><thead><tr><th>Item</th><th>Status</th><th class="num">On hand</th><th class="num">Reorder at</th><th class="num">Suggested order</th></tr></thead><tbody>
+        ${d.alerts.map((x) => `<tr class="st-row-${STATUS_COLOUR[x.status]}"><td>${esc(x.name)}</td><td>${stBadge(x.status)} ${incomingBadge(x.incoming, x.unit)}</td>
+          <td class="num">${fmtQty(x.on_hand, x.unit)}</td><td class="num">${fmtQty(x.par_level, x.unit)}</td>
+          <td class="num">${x.suggested_order != null ? fmtQty(x.suggested_order, x.unit) : `<span class="muted small">after 3 closed days</span>`}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="muted">Nothing is low or out of stock.</div>`}
+      ${d.open_pos ? `<div class="small muted" style="margin-top:10px">${d.open_pos} purchase order(s) waiting for delivery.</div>` : ""}
+      ${posOn && d.open_shifts?.length ? `<h3 style="margin-top:14px">Open cash shifts</h3><table><tbody>${d.open_shifts.map((x) =>
+        `<tr><td>${esc(x.staff_name)}</td><td class="small muted">since ${esc(x.opened_at.slice(11, 16))}</td><td class="num">${money(x.expected_cash_now)} expected in drawer</td></tr>`).join("")}</tbody></table>` : ""}
     </div>`;
   el.querySelectorAll("[data-f]").forEach((b) => b.addEventListener("click", () => { S.stockFilter = b.dataset.f; S.view = "stock"; render(); }));
+  el.querySelectorAll("[data-days]").forEach((b) => b.addEventListener("click", () => { S.dashDays = Number(b.dataset.days); viewDashboard(el); }));
   if (isManager()) setupChecklist(document.getElementById("setupck"));
 }
 
@@ -332,8 +402,8 @@ async function setupChecklist(box) {
   try { st = await api("/api/setup/status"); } catch { return; }
   const todo = st.items.filter((i) => !i.done);
   if (!todo.length || !box) return;
-  box.innerHTML = `<div class="panel" style="margin-bottom:14px"><h3>Getting ready to trade · ${st.items.length - todo.length} of ${st.items.length} done</h3>
-    <ul class="checklist">${st.items.map((i) => `<li>${i.done ? "✅" : "⬜"} ${esc(i.label)}</li>`).join("")}</ul>
+  box.innerHTML = `<div class="panel" style="margin-bottom:14px"><h3>Setup · ${st.items.length - todo.length} of ${st.items.length} done</h3>
+    <ul class="checklist">${todo.map((i) => `<li><span class="ck"></span>${esc(i.label)}</li>`).join("")}</ul>
     ${st.flagged_items.length ? `<div class="small">Menu items to review: ${st.flagged_items.map((f) => esc(f.name)).join(", ")}.
       ${can("catalog.edit") ? `<button class="btn" id="gorev">Review now</button>` : ""}</div>` : ""}</div>`;
   box.querySelector("#gorev")?.addEventListener("click", () => { S.view = "setup"; S.setupTab = "menu"; S.menuFlag = true; render(); });
@@ -824,7 +894,7 @@ function receiptHTML(o) {
 
 function receiptModal(o) {
   const m = modal(`
-    <h2>${o.status === "void" ? "Voided order" : o.duplicate ? "Already paid ✓ (no second charge)" : "Paid ✓"} ${o.payment_method === "cash" && o.status !== "void" ? `· Change ${money(o.change)}` : ""}</h2>
+    <h2>${o.status === "void" ? "Voided order" : o.duplicate ? "Already paid (no second charge)" : "Paid"} ${o.payment_method === "cash" && o.status !== "void" ? `· Change ${money(o.change)}` : ""}</h2>
     ${receiptHTML(o)}
     <div class="actions"><button class="btn" id="print">Print receipt</button><button class="btn primary big" id="done" autofocus>New order</button></div>`);
   m.querySelector("#print").onclick = () => printHTML(receiptHTML(o), true);
@@ -870,7 +940,7 @@ async function shiftModal() {
     try {
       const r = await api(`/api/shifts/${sh.id}/close`, { method: "POST", json: { counted_cash: Number(v), notes: m.querySelector("#cn").value || null } });
       closeModal(); await refreshState(); render();
-      toast(r.cash_variance ? `Shift closed. Cash ${r.cash_variance > 0 ? "over" : "short"} by ${money(Math.abs(r.cash_variance))}` : "Shift closed. Cash matches ✓", !!r.cash_variance);
+      toast(r.cash_variance ? `Shift closed. Cash ${r.cash_variance > 0 ? "over" : "short"} by ${money(Math.abs(r.cash_variance))}` : "Shift closed. Cash matches", !!r.cash_variance);
     } catch (e) { m.querySelector("#serr").textContent = e.message; }
   };
 }
@@ -1216,8 +1286,12 @@ async function viewOpenDay(el) {
   if (!prev) return;
   const rows = prev.rows;
   const first = S.state.first_day;
-  el.innerHTML = `<div class="panel">
-    <h2>Open the day</h2>
+  el.innerHTML = `${first && can("data.import") ? `<div class="panel"><h2>Start from your existing records</h2>
+      <p style="margin-top:0">If this month's stock was kept in Excel or a CSV, bring it in here. Each recorded day is added as a closed day,
+        and today opens with the last closing count, so nothing has to be counted or typed again.</p>
+      <div id="openimp"></div></div>` : ""}
+    <div class="panel">
+    <h2>${first ? "Or open the day with a fresh count" : "Open the day"}</h2>
     ${first ? `<div class="note"><b>First day:</b> count everything in the store and enter it below. From tomorrow, opening stock is carried over automatically from the previous night's closing count.</div>`
             : `<div class="info">Opening stock is carried over from the last closing count${prev.last_day ? ` (<b>${esc(prev.last_day.business_date)}</b>${prev.last_day.source === "workbook" ? ", imported from the workbook" : ""})` : ""}. Only change a number if the morning count is different; the change is recorded.</div>`}
     <div class="row" style="max-width:300px"><div><label>Business date</label><input id="bd" type="date" value="${today()}"></div></div>
@@ -1230,6 +1304,7 @@ async function viewOpenDay(el) {
     <div class="err" id="oerr"></div>
     <div style="margin-top:12px"><button class="btn primary big" id="open">Open day</button></div>
   </div>`;
+  if (document.getElementById("openimp")) recordsImporter(document.getElementById("openimp"), { openDay: true });
   document.getElementById("open").onclick = async (e) => {
     const counts = {};
     el.querySelectorAll("[data-o]").forEach((i) => { if (i.value !== "") counts[i.dataset.o] = fromBig(i.value, i.dataset.u); });
@@ -1355,7 +1430,7 @@ function reportHTML(r) {
       <td class="num">${l.variance == null ? "–" : fmtQty(l.variance, l.unit, true)}</td>
       <td class="num">${l.variance_value == null ? "–" : money(l.variance_value)}</td>
       <td class="small">${esc([l.reason, l.note].filter(Boolean).join(" – "))}</td></tr>`).join("")}</tbody></table></div>
-    <div class="grid2" style="margin-top:14px">
+    <div class="grid2 dashgrid" style="margin-top:14px">
       <div><h3>Items sold</h3><table><thead><tr><th>Item</th><th class="num">Qty</th><th class="num">At list price</th></tr></thead><tbody>
         ${r.items.map((i) => `<tr><td>${esc(i.name)}</td><td class="num">${i.qty}</td><td class="num">${money(i.amt)}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">None</td></tr>`}</tbody></table>
         <h3 style="margin-top:14px">Cash shifts</h3><table><thead><tr><th>Cashier</th><th class="num">Expected</th><th class="num">Counted</th><th class="num">Over / short</th></tr></thead><tbody>
@@ -1683,13 +1758,7 @@ async function setupExcel(sv) {
     <div class="note">Check first: nothing is saved until you press <b>Import</b>, and if any row has a problem nothing is saved. Importing replaces the recipe of every dish in the file; an item's unit can't change once it has stock history.</div>
     <div class="row"><div><input type="file" id="f" accept=".xlsx,.csv"></div><div class="shrink"><button class="btn" id="pv">Check file</button></div><div class="shrink"><button class="btn primary" id="up" disabled>Import</button></div></div>
     <div class="err" id="xerr"></div><div id="xok"></div></div>
-    <div class="panel"><h2>Import stock history (daily stock-movement workbook)</h2>
-      <p class="small">For sheets with <i>opening / additions / closing / actual sales / system sales / variance</i>, one sheet per day (e.g. "oct 2026 stock movement.xlsx").
-        Each sheet becomes a closed, read-only day; the last closing becomes the next opening stock. The workbook itself is never changed.</p>
-      <div class="row"><div><input type="file" id="wf" accept=".xlsx"></div>
-        <div class="shrink"><label>Month (if not in file name)</label><input id="wm" type="month" style="width:170px"></div>
-        <div class="shrink"><button class="btn" id="wa">Analyse workbook</button></div></div>
-      <div class="err" id="werr"></div><div id="wout"></div></div>`;
+    <div class="panel"><h2>Import past stock records</h2><div id="recimp"></div></div>`;
   document.getElementById("dl").onclick = () => download("/api/excel", "cfc-recipes.xlsx");
   document.getElementById("mdl")?.addEventListener("click", () => download("/api/export/menu.csv", "menu.csv"));
   const sendMenu = async (preview) => {
@@ -1699,7 +1768,7 @@ async function setupExcel(sv) {
     const fd = new FormData(); fd.append("file", f);
     try {
       const r = await api(`/api/import/menu?preview=${preview}&hide_missing=${document.getElementById("mh").checked}`, { method: "POST", body: fd });
-      document.getElementById("mok").innerHTML = `<div class="info" style="margin-top:10px">${preview ? "File is OK. It would load" : "Menu imported ✓"}
+      document.getElementById("mok").innerHTML = `<div class="info" style="margin-top:10px">${preview ? "File is OK. It would load" : "Menu imported."}
         ${r.rows} items in ${r.categories} categories: ${r.created} new, ${r.updated} updated, ${r.unchanged} unchanged.
         ${r.price_changes.length ? `<br><b>Price changes:</b> ${r.price_changes.map((p) => esc(`${p.item} ${p.old} → ${p.new}`)).join("; ")}` : ""}
         ${r.hidden_missing.length ? `<br><b>Hidden (not in file):</b> ${r.hidden_missing.map(esc).join(", ")}` : ""}
@@ -1720,7 +1789,7 @@ async function setupExcel(sv) {
     const fd = new FormData(); fd.append("file", f);
     try {
       const r = await api("/api/excel" + (preview ? "?preview=true" : ""), { method: "POST", body: fd });
-      document.getElementById("xok").innerHTML = `<div class="info" style="margin-top:10px">${preview ? "File is OK. It would import" : "Imported ✓"}
+      document.getElementById("xok").innerHTML = `<div class="info" style="margin-top:10px">${preview ? "File is OK. It would import" : "Imported."}
         ${r.ingredients} items (${r.new_ingredients} new, ${r.updated} updated), ${r.menu_items} menu items, ${r.recipe_lines} recipe lines.
         ${r.changes?.length ? `<br><b>Changes to existing prices/costs:</b> ${r.changes.map((c) => esc(`${c.menu_item || c.ingredient}: ${c.field} ${c.old} → ${c.new}`)).join("; ")}` : ""}</div>`;
       document.getElementById("up").disabled = !preview;
@@ -1730,57 +1799,74 @@ async function setupExcel(sv) {
   document.getElementById("f").onchange = () => { document.getElementById("up").disabled = true; };
   document.getElementById("pv").onclick = () => send(true);
   document.getElementById("up").onclick = () => send(false);
-  document.getElementById("wa").onclick = () => analyseWorkbook();
+  recordsImporter(document.getElementById("recimp"), { openDay: false });
 }
 
-async function analyseWorkbook() {
-  const f = document.getElementById("wf").files[0];
-  const out = document.getElementById("wout"), err = document.getElementById("werr");
-  err.textContent = ""; out.innerHTML = "";
-  if (!f) return (err.textContent = "Choose the workbook first.");
-  const fd = new FormData(); fd.append("file", f);
-  const wm = document.getElementById("wm").value;
-  const qs = wm ? `year=${Number(wm.slice(0, 4))}&month=${Number(wm.slice(5, 7))}` : "";
-  let r;
-  try { r = await api("/api/import/stock-workbook" + (qs ? "?" + qs : ""), { method: "POST", body: fd }); } catch (e) { return (err.textContent = e.message); }
-  const lvl = { error: "bad", warning: "warn", info: "grey" };
+/**
+ * Past stock records (this month so far, or any earlier period) in whatever layout they were kept:
+ * CFC's workbook with one sheet per day, or one table (CSV / Excel) with a date column.
+ * Units come from the file, from matching stock items or from the numbers themselves; only items
+ * that can't be told apart are asked about. Optionally opens today with the last closing carried over.
+ */
+function recordsImporter(box, { openDay }) {
   const units = ["", "kg", "g", "L", "ml", "pcs"];
-  out.innerHTML = `
-    ${r.already_imported ? `<div class="note">This exact file was already imported on ${esc(r.already_imported)}. Importing again is blocked.</div>` : ""}
-    <div class="info">Period: <b>${r.month ? esc(r.year + "-" + String(r.month).padStart(2, "0")) : "unknown — choose the month above and analyse again"}</b> ·
-      ${r.sheets.length} sheets (${r.sheets.map((s) => esc(s.name)).join(", ")}) ·
-      <span class="tag bad">${r.counts.error} errors</span> <span class="tag warn">${r.counts.warning} warnings</span> <span class="tag grey">${r.counts.info} notes</span></div>
-    <h3>1. Confirm the unit each item is counted in</h3>
-    <div class="small muted" style="margin-bottom:6px">Suggestions are only suggestions (whole numbers everywhere → pieces). Nothing is imported until every unit is confirmed.</div>
-    <div class="tablewrap"><table><thead><tr><th>Workbook item</th><th>Unit in workbook</th><th>Matches existing item</th><th class="num">Period usage</th><th class="num">POS sold</th><th class="num">Variance</th></tr></thead><tbody>
-      ${r.items.map((i) => `<tr><td><b>${esc(i.item)}</b></td>
-        <td><select data-wu="${esc(i.key)}" aria-label="Unit for ${esc(i.item)}">${units.map((u) => `<option value="${u}" ${u && u === i.suggested_unit ? "selected" : ""}>${u || "— choose —"}</option>`).join("")}</select>
-          ${i.suggested_unit ? `<div class="small muted">suggested</div>` : `<div class="small" style="color:var(--bad)">no safe suggestion</div>`}</td>
-        <td class="small">${i.existing ? `${esc(i.existing.name)} (${esc(i.existing.unit)})` : "new item"}</td>
-        <td class="num">${i.total_actual}</td><td class="num">${i.total_system}</td>
-        <td class="num" style="${i.total_variance < 0 ? "color:var(--bad)" : ""}">${i.total_variance > 0 ? "+" : ""}${i.total_variance}</td></tr>`).join("")}
-    </tbody></table></div>
-    <h3 style="margin-top:14px">2. Review discrepancies</h3>
-    <div class="tablewrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>Level</th><th>Sheet</th><th>Item</th><th>Finding</th></tr></thead><tbody>
-      ${r.issues.filter((i) => i.code !== "split_count").map((i) => `<tr><td><span class="tag ${lvl[i.level]}">${i.level}</span></td><td>${esc(i.sheet || "")}</td><td>${esc(i.item || "")}</td><td class="small">${esc(i.message)}</td></tr>`).join("")}
-    </tbody></table></div>
-    <div class="err" id="wcerr"></div>
-    <div style="margin-top:12px"><button class="btn primary" id="wc" ${r.counts.error || r.already_imported || !r.month ? "disabled" : ""}>3. Import as history</button></div>`;
-  document.getElementById("wc")?.addEventListener("click", async (e) => {
-    const mapping = {};
-    let missing = [];
-    out.querySelectorAll("[data-wu]").forEach((s) => { if (s.value) mapping[s.dataset.wu] = { unit: s.value }; else missing.push(s.dataset.wu); });
-    if (missing.length) return (document.getElementById("wcerr").textContent = "Choose a unit for: " + missing.join(", "));
-    if (!confirm("Import these days as closed history? This can't be undone from the app (a database backup is recommended first).")) return;
-    const fd2 = new FormData(); fd2.append("file", f); fd2.append("mapping", JSON.stringify(mapping));
-    e.target.disabled = true;
-    try {
-      const res = await api("/api/import/stock-workbook?commit=true" + (qs ? "&" + qs : ""), { method: "POST", body: fd2 });
-      out.innerHTML = `<div class="info">Imported ✓ ${res.days} days, ${res.lines} stock lines, ${res.movements} movements. New items: ${res.new_ingredients.map(esc).join(", ") || "none"}.
-        Set purchase costs and reorder levels under <b>Items & thresholds</b> so status colours and valuation work.</div>`;
-      await refreshState();
-    } catch (x) { document.getElementById("wcerr").textContent = x.message; e.target.disabled = false; }
-  });
+  box.innerHTML = `<p class="small muted" style="margin-top:0">Excel or CSV. Either one sheet per day with opening, additions and closing columns,
+      or one table with a date column (date, item, opening, received, closing, sales, waste, unit, unit cost, note; most column names are recognised).
+      A blank opening is taken from the item's previous closing. The file itself is never changed.</p>
+    <div class="dropzone"><div class="row"><div><input type="file" id="ri-f" accept=".xlsx,.csv" aria-label="Records file"></div>
+      <div class="shrink"><label>Month (only if dates have no month)</label><input id="ri-m" type="month" style="width:170px"></div>
+      <div class="shrink"><button class="btn" id="ri-a">Read file</button></div></div></div>
+    <div class="err" id="ri-e"></div><div id="ri-o"></div>`;
+  const $ = (id) => box.querySelector("#" + id);
+  const qs = () => { const v = $("ri-m").value; return v ? `&year=${Number(v.slice(0, 4))}&month=${Number(v.slice(5, 7))}` : ""; };
+  $("ri-a").onclick = async () => {
+    const f = $("ri-f").files[0];
+    $("ri-e").textContent = ""; $("ri-o").innerHTML = "";
+    if (!f) return ($("ri-e").textContent = "Choose the file first.");
+    const fd = new FormData(); fd.append("file", f);
+    let r;
+    try { r = await api("/api/import/stock-workbook?auto_units=true" + qs(), { method: "POST", body: fd }); } catch (e) { return ($("ri-e").textContent = e.message); }
+    const errors = r.issues.filter((i) => i.level === "error");
+    const warns = r.issues.filter((i) => i.level === "warning");
+    const ask = r.items.filter((i) => !i.resolved_unit);
+    const blocked = errors.length || r.already_imported || !r.first_date || r.conflict_date || r.open_day_exists;
+    const why = r.already_imported ? `This exact file was already imported on ${esc(r.already_imported)}.`
+      : r.conflict_date ? `The system already has records from ${esc(r.conflict_date)}, so earlier days can't be added in front of them.`
+      : r.open_day_exists ? "A day is open. Close it first, then import." : !r.first_date ? "No dated rows were found." : "";
+    $("ri-o").innerHTML = `
+      <div class="info" style="margin-top:12px"><b>${r.sheets.length} day${r.sheets.length === 1 ? "" : "s"}</b>
+        ${r.first_date ? `from ${esc(r.first_date)} to ${esc(r.last_date)}` : ""} · <b>${r.items.length}</b> items ·
+        ${r.format === "table" ? "one table" : "one sheet per day"}
+        ${errors.length ? ` · <span class="tag bad">${errors.length} to fix</span>` : ""}${warns.length ? ` · <span class="tag warn">${warns.length} to review</span>` : ""}</div>
+      ${why ? `<div class="note">${why}</div>` : ""}
+      ${errors.length ? `<h3>Fix these in the file, then read it again</h3><div class="tablewrap" style="max-height:260px;overflow:auto"><table><tbody>
+        ${errors.map((i) => `<tr><td>${esc(i.sheet || "")}</td><td>${esc(i.item || "")}</td><td class="small">${esc(i.message)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+      ${ask.length ? `<h3>Which unit is each of these counted in?</h3><div class="small muted" style="margin-bottom:6px">Everything else was recognised automatically.</div>
+        <div class="tablewrap"><table><tbody>${ask.map((i) => `<tr><td><b>${esc(i.item)}</b></td><td style="width:160px"><select data-ru="${esc(i.key)}" aria-label="Unit for ${esc(i.item)}">${units.map((u) => `<option value="${u}">${u || "choose"}</option>`).join("")}</select></td></tr>`).join("")}</tbody></table></div>` : ""}
+      <details style="margin-top:10px"><summary class="small">Units used for each item</summary><div class="tablewrap"><table><thead><tr><th>Item</th><th>Unit</th><th>From</th><th>Stock item</th></tr></thead><tbody>
+        ${r.items.map((i) => `<tr><td>${esc(i.item)}</td><td>${esc(i.resolved_unit || "—")}</td><td class="small muted">${{ file: "unit column", existing: "existing item", suggested: "the numbers and name", chosen: "your choice" }[i.unit_source] || "needs a choice"}</td>
+          <td class="small">${i.existing ? esc(i.existing.name) : "new"}</td></tr>`).join("")}</tbody></table></div></details>
+      ${warns.length ? `<details style="margin-top:8px"><summary class="small">${warns.length} findings to review (imported as recorded)</summary><div class="tablewrap" style="max-height:300px;overflow:auto"><table><tbody>
+        ${warns.map((i) => `<tr><td>${esc(i.sheet || "")}</td><td>${esc(i.item || "")}</td><td class="small">${esc(i.message)}</td></tr>`).join("")}</tbody></table></div></details>` : ""}
+      <div class="err" id="ri-ce"></div>
+      <div style="margin-top:12px"><button class="btn primary" id="ri-c" ${blocked ? "disabled" : ""}>${openDay ? "Import and open today" : "Import records"}</button></div>`;
+    $("ri-c")?.addEventListener("click", async (e) => {
+      const mapping = {}; const missing = [];
+      box.querySelectorAll("[data-ru]").forEach((sel) => { if (sel.value) mapping[sel.dataset.ru] = { unit: sel.value }; else missing.push(sel.dataset.ru); });
+      if (missing.length) return ($("ri-ce").textContent = "Choose a unit for: " + missing.join(", "));
+      const fd2 = new FormData(); fd2.append("file", f); fd2.append("mapping", JSON.stringify(mapping));
+      e.target.disabled = true;
+      try {
+        const res = await api(`/api/import/stock-workbook?commit=true&auto_units=true${openDay ? "&open_day=true" : ""}` + qs(), { method: "POST", body: fd2 });
+        await refreshState();
+        toast(`Imported ${res.days} days of records` + (res.opened_day ? `; ${res.opened_day.business_date} is open` : ""));
+        if (openDay) { S.view = "dash"; render(); return; }
+        $("ri-o").innerHTML = `<div class="info" style="margin-top:12px">Imported ${res.days} days, ${res.lines} stock lines.
+          ${res.new_ingredients.length ? `New stock items: ${res.new_ingredients.map(esc).join(", ")}.` : ""}
+          ${res.costs_set.length ? ` Purchase costs taken from the file for ${res.costs_set.length} items.` : ""}</div>`;
+      } catch (x) { $("ri-ce").textContent = x.message; e.target.disabled = false; }
+    });
+  };
 }
 
 async function setupStaff(sv) {
@@ -1841,7 +1927,8 @@ async function setupSettings(sv) {
     <div class="row"><div><label>Closing tolerance (%)</label><input id="tp" type="number" step="0.5" min="0" max="20" value="${esc(s.variance_tolerance_pct)}"></div>
       <div><label>Critical = % of reorder level (if no own level)</label><input id="cp" type="number" min="0" max="100" value="${esc(s.critical_pct_of_reorder)}"></div>
       <div><label>Reorder suggestion covers (days)</label><input id="rc" type="number" min="0" max="60" value="${esc(s.reorder_cover_days)}"></div></div>
-    <div class="row"><div><label>Purchase cost updates when goods are received</label>${sel("cm", [["manual", "Never – I set costs manually"], ["last_purchase", "Use the last purchase cost"], ["weighted_average", "Weighted average cost"]], s.cost_method)}</div></div>
+    <div class="row"><div><label>Opening the day</label>${sel("ao", [["0", "A manager opens each day"], ["1", "Opens automatically with the first stock entry"]], s.auto_open_day || "0")}</div></div>
+    <div class="row"><div><label>Purchase cost updates when goods are received</label>${sel("cm", [["manual", "Only an item's first purchase price; after that I set costs"], ["last_purchase", "Use the last purchase cost"], ["weighted_average", "Weighted average cost"]], s.cost_method)}</div></div>
     <div class="err" id="serr"></div>
     <div style="margin-top:14px"><button class="btn primary" id="s">Save settings</button></div></div>`;
   document.getElementById("s").onclick = async () => {
@@ -1852,7 +1939,7 @@ async function setupSettings(sv) {
         variance_tolerance_pct: Number(v("tp")), tax_rate_pct: Number(v("tr") || 0), tax_inclusive: v("ti") === "1", tax_label: v("tl") || "VAT",
         cashier_max_discount_pct: Number(v("md") || 0), critical_pct_of_reorder: Number(v("cp") || 0), reorder_cover_days: Number(v("rc") || 0),
         cost_method: v("cm"), require_shift: v("rs") === "1", session_idle_minutes: Number(v("si") || 720),
-        order_types: v("ot"), ask_guests: v("ag") === "1", serving_periods: v("sp") } });
+        order_types: v("ot"), ask_guests: v("ag") === "1", serving_periods: v("sp"), auto_open_day: v("ao") === "1" } });
       await refreshState(); toast("Saved"); render();
     } catch (e) { document.getElementById("serr").textContent = e.message; }
   };

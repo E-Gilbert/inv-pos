@@ -296,11 +296,53 @@ def to_csv(rows, columns):
 
 # ---------------------------------------------------------------- stock-movement workbook (history)
 
-def import_history(c, parsed, mapping, staff_id, filename=None):
-    """Commit a parsed stock-movement workbook (see workbook.py) as closed, read-only history days.
+BASE_TO_COUNT_UNIT = {"g": "kg", "ml": "L", "pcs": "pcs"}
+
+
+def resolve_units(c, parsed, mapping=None, auto=False):
+    """Decide the unit each item in the file is counted in.
+
+    Order: what the user chose > a unit column in the file > the matching existing stock item >
+    the suggestion from the numbers and the name. Without `auto` only the user's choice counts
+    (the original, fully manual behaviour). Returns {key: {"unit", "source", "existing"}}; unit is
+    None when nothing is safe to assume.
+    """
+    from .workbook import WORKBOOK_UNITS
+    mapping = {k.lower(): v for k, v in (mapping or {}).items()}
+    existing = {r["name"].lower(): dict(r) for r in c.execute("SELECT id, name, unit FROM ingredients")}
+    out = {}
+    for it in parsed["items"]:
+        m = mapping.get(it["key"]) or {}
+        ex = None
+        if m.get("ingredient_id"):
+            row = c.execute("SELECT id, name, unit FROM ingredients WHERE id = ?", (int(m["ingredient_id"]),)).fetchone()
+            ex = dict(row) if row else None
+        else:
+            ex = existing.get(it["key"])
+        unit, source = str(m.get("unit") or "").strip(), "chosen"
+        if unit.lower() not in WORKBOOK_UNITS:
+            unit, source = None, None
+            if auto:
+                fu = it.get("file_unit")
+                if fu and (not ex or WORKBOOK_UNITS[fu.lower()][0] == ex["unit"]):
+                    unit, source = fu, "file"
+                elif ex:
+                    sug = it.get("suggested_unit")
+                    same_base = sug and WORKBOOK_UNITS[sug.lower()][0] == ex["unit"]
+                    unit, source = (sug if same_base else BASE_TO_COUNT_UNIT[ex["unit"]]), "existing"
+                elif it.get("suggested_unit"):
+                    unit, source = it["suggested_unit"], "suggested"
+        out[it["key"]] = {"unit": unit, "source": source, "existing": ex}
+    return out
+
+
+def import_history(c, parsed, mapping, staff_id, filename=None, auto_units=False):
+    """Commit parsed stock records (see workbook.py) as closed, read-only history days.
 
     mapping: {item_key: {"unit": "kg|g|L|ml|pcs", "ingredient_id": optional existing id}}
-    Nothing is guessed: every item needs a confirmed unit. All-or-nothing.
+    With auto_units, items without a chosen unit use the file's unit column, the matching stock
+    item or a safe suggestion (see resolve_units); only items with none of those must be chosen.
+    All-or-nothing.
     """
     from .db import audit, now
     from .workbook import WORKBOOK_UNITS
@@ -308,7 +350,7 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
     errors = [f"{i['sheet'] or ''} {i['item'] or ''}: {i['message']}".strip()
               for i in parsed["issues"] if i["level"] == "error"]
     if errors:
-        raise ImportErrors(["The workbook has errors that must be fixed first:"] + errors)
+        raise ImportErrors(["The file has problems that must be fixed first:"] + errors)
     if not (parsed.get("year") and parsed.get("month")):
         raise ValueError("Which month and year is this workbook? (Name it like 'oct 2026 …' or choose the month.)")
     if c.execute("SELECT 1 FROM import_batches WHERE kind = 'stock_history' AND sha256 = ?", (parsed["sha256"],)).fetchone():
@@ -325,23 +367,21 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
         raise ValueError(f"The system already has a day on or after {first} ({clash['business_date']}). History can only be "
                          "imported for dates before everything already recorded, otherwise opening stock would be wrong.")
 
+    plan = resolve_units(c, parsed, mapping, auto_units)
     resolved, errs = {}, []
-    mapping = {k.lower(): v for k, v in (mapping or {}).items()}
     for it in parsed["items"]:
-        m = mapping.get(it["key"]) or {}
-        unit = str(m.get("unit") or "").strip().lower()
-        if unit not in WORKBOOK_UNITS:
+        p = plan[it["key"]]
+        unit = (p["unit"] or "").strip()
+        if unit.lower() not in WORKBOOK_UNITS:
             errs.append(f"{it['item']}: choose the unit the workbook counts it in (kg, g, L, ml or pcs).")
             continue
-        base, scale = WORKBOOK_UNITS[unit]
+        base, scale = WORKBOOK_UNITS[unit.lower()]
         ing = None
-        if m.get("ingredient_id"):
-            ing = c.execute("SELECT * FROM ingredients WHERE id = ?", (int(m["ingredient_id"]),)).fetchone()
-            if not ing:
-                errs.append(f"{it['item']}: the chosen existing item no longer exists.")
-                continue
-        else:
-            ing = c.execute("SELECT * FROM ingredients WHERE name = ?", (it["item"],)).fetchone()
+        if p["existing"]:
+            ing = c.execute("SELECT * FROM ingredients WHERE id = ?", (p["existing"]["id"],)).fetchone()
+        elif (mapping or {}).get(it["key"], {}).get("ingredient_id"):
+            errs.append(f"{it['item']}: the chosen existing item no longer exists.")
+            continue
         if ing and ing["unit"] != base:
             errs.append(f"{it['item']}: '{ing['name']}' is measured in {ing['unit']} but you chose {unit}.")
             continue
@@ -352,36 +392,46 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
                 errs.append(f"{it['item']}: has fractional quantities (e.g. sheet '{fractional[0]}'), so it can't be counted in pieces. "
                             "Choose kg/g/L/ml, or correct the sheet.")
                 continue
-        resolved[it["key"]] = {"ing": ing, "base": base, "scale": scale, "name": it["item"], "unit": unit}
+        resolved[it["key"]] = {"ing": ing, "base": base, "scale": scale, "name": it["item"], "unit": unit,
+                               "source": p["source"], "cost": it.get("file_cost")}
     if errs:
         raise ImportErrors(errs)
 
     batch = c.execute("INSERT INTO import_batches(kind, filename, sha256, staff_id, created_at) VALUES ('stock_history', ?, ?, ?, ?)",
                       (filename, parsed["sha256"], staff_id, now())).lastrowid
-    created = []
+    created, costed = [], []
     for r in resolved.values():
+        cost = (r["cost"] / r["scale"]) if r["cost"] else 0
         if r["ing"] is None:
-            iid = c.execute("INSERT INTO ingredients(name, unit, cost_per_unit, par_level, count_daily) VALUES (?, ?, 0, 0, 1)",
-                            (r["name"], r["base"])).lastrowid
+            iid = c.execute("INSERT INTO ingredients(name, unit, cost_per_unit, par_level, count_daily) VALUES (?, ?, ?, 0, 1)",
+                            (r["name"], r["base"], cost)).lastrowid
             r["ing"] = c.execute("SELECT * FROM ingredients WHERE id = ?", (iid,)).fetchone()
             created.append(r["name"])
-    stats = {"days": 0, "lines": 0, "movements": 0, "new_ingredients": created, "matched": [
+        elif cost and not r["ing"]["cost_per_unit"]:
+            c.execute("UPDATE ingredients SET cost_per_unit = ? WHERE id = ?", (cost, r["ing"]["id"]))
+            r["ing"] = c.execute("SELECT * FROM ingredients WHERE id = ?", (r["ing"]["id"],)).fetchone()
+        if cost:
+            costed.append(r["name"])
+    stats = {"days": 0, "lines": 0, "movements": 0, "new_ingredients": created, "costs_set": costed, "matched": [
         {"workbook": r["name"], "ingredient": r["ing"]["name"]} for r in resolved.values() if r["name"] not in created]}
 
     for s in sheets:
         d0, d1 = s["dates"][0], s["dates"][-1]
+        source_note = (f"Imported from workbook sheet '{s['name']}'" if parsed.get("format") != "table"
+                       else f"Imported from {filename or 'records file'}")
         day_id = c.execute(
             """INSERT INTO days(business_date, status, opened_at, closed_at, notes, source, covers_to, import_batch_id)
                VALUES (?, 'closed', ?, ?, ?, 'workbook', ?, ?)""",
-            (d0, now(), now(), f"Imported from workbook sheet '{s['name']}'" + (f" (covers {d0} to {d1})" if d1 != d0 else ""),
+            (d0, now(), now(), source_note + (f" (covers {d0} to {d1})" if d1 != d0 else ""),
              d1 if d1 != d0 else None, batch)).lastrowid
         stats["days"] += 1
         for row in s["rows"]:
             r = resolved[row["key"]]
             k = r["scale"]
             ing = r["ing"]
-            opening, added, closing, system = (round((row[f] or 0) * k, 6) for f in ("opening", "additions", "closing", "system"))
-            expected = round(opening + added - system, 6)
+            opening, added, closing, system, wasted = (round((row.get(f) or 0) * k, 6)
+                                                       for f in ("opening", "additions", "closing", "system", "waste"))
+            expected = round(opening + added - system - wasted, 6)
             variance = round(closing - expected, 6)
             reason = None
             if row["note"]:
@@ -390,10 +440,10 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
                 reason = "Imported (no reason recorded)"
             c.execute(
                 """INSERT INTO day_stock(day_id, ingredient_id, opening, delivered, adjusted, sold, wasted, expected,
-                                         counted, variance, reason) VALUES (?,?,?,?,0,?,0,?,?,?,?)""",
-                (day_id, ing["id"], opening, added, system, expected, closing, variance, reason))
+                                         counted, variance, reason) VALUES (?,?,?,?,0,?,?,?,?,?,?)""",
+                (day_id, ing["id"], opening, added, system, wasted, expected, closing, variance, reason))
             stats["lines"] += 1
-            note = f"Workbook '{s['name']}'"
+            note = f"Workbook '{s['name']}'" if parsed.get("format") != "table" else f"Records {s['name']}"
             if added:
                 c.execute("""INSERT INTO stock_movements(day_id, ingredient_id, type, qty, unit_cost, note, staff_id, created_at)
                              VALUES (?, ?, 'delivery', ?, ?, ?, ?, ?)""", (day_id, ing["id"], added, ing["cost_per_unit"], note, staff_id, now()))
@@ -403,7 +453,15 @@ def import_history(c, parsed, mapping, staff_id, filename=None):
                              VALUES (?, ?, 'external_sale', ?, ?, ?, ?, ?)""",
                           (day_id, ing["id"], -system, ing["cost_per_unit"], note + " – other POS", staff_id, now()))
                 stats["movements"] += 1
+            if wasted:
+                c.execute("""INSERT INTO stock_movements(day_id, ingredient_id, type, qty, unit_cost, reason, note, staff_id, created_at)
+                             VALUES (?, ?, 'waste', ?, ?, ?, ?, ?, ?)""",
+                          (day_id, ing["id"], -wasted, ing["cost_per_unit"], (row["note"] or "Not given")[:100], note, staff_id, now()))
+                stats["movements"] += 1
+    stats["last_date"] = sheets[-1]["dates"][-1]
     summary = {k: v for k, v in stats.items()} | {"units": {r["name"]: r["unit"] for r in resolved.values()},
+                                                   "auto_units": {r["name"]: r["unit"] for r in resolved.values()
+                                                                  if r["source"] not in ("chosen", None)},
                                                    "warnings": parsed["counts"].get("warning", 0)}
     c.execute("UPDATE import_batches SET summary = ? WHERE id = ?", (json.dumps(summary), batch))
     audit(c, staff_id, "import.stock_history", "import_batch", batch, summary | {"filename": filename})

@@ -86,11 +86,26 @@ def open_day_row(c):
     return c.execute("SELECT * FROM days WHERE status = 'open'").fetchone()
 
 
-def require_open_day(c):
+def business_today():
+    """Today's business date on the server clock (TZ=Africa/Nairobi in the cloud)."""
+    return date.today().isoformat()
+
+
+def require_open_day(c, staff_id=None):
+    """The open day. With the 'auto_open_day' setting on, the first stock entry of a new day opens it
+    with last night's closing carried over, so nobody has to open the day by hand. The very first
+    day still needs a manager (there is no closing count to carry over yet)."""
     day = open_day_row(c)
-    if not day:
-        raise RuleError("No business day is open. A manager must open the day first.")
-    return day
+    if day:
+        return day
+    if get_setting(c, "auto_open_day") == "1" and last_closed_day(c):
+        today = business_today()
+        latest = c.execute("SELECT MAX(COALESCE(covers_to, business_date)) FROM days").fetchone()[0]
+        if not latest or today > latest:
+            day_id = open_day(c, staff_id, today)
+            audit(c, staff_id, "day.auto_open", "day", day_id, {"business_date": today})
+            return c.execute("SELECT * FROM days WHERE id = ?", (day_id,)).fetchone()
+    raise RuleError("No business day is open. A manager must open the day first.")
 
 
 def last_closed_day(c):
@@ -526,8 +541,8 @@ def apply_cost(c, ingredient_id, qty, unit_cost, staff_id):
     method = get_setting(c, "cost_method")
     ing = c.execute("SELECT cost_per_unit FROM ingredients WHERE id = ?", (ingredient_id,)).fetchone()
     old = ing["cost_per_unit"] or 0
-    if method == "last_purchase":
-        new = unit_cost
+    if method == "last_purchase" or not old:
+        new = unit_cost  # an item with no cost yet takes the first price it is bought at, whatever the method
     elif method == "weighted_average":
         have = max(on_hand(c, ingredient_id) - qty, 0)  # stock before this delivery (delivery already recorded)
         new = (have * old + qty * unit_cost) / (have + qty) if (have + qty) > 0 else unit_cost
@@ -543,7 +558,7 @@ def apply_cost(c, ingredient_id, qty, unit_cost, staff_id):
 def record_movement(c, staff_id, ingredient_id, kind, qty, reason=None, note=None, unit_cost=None, client_ref=None):
     if client_ref and c.execute("SELECT 1 FROM stock_movements WHERE client_ref = ?", (client_ref,)).fetchone():
         return False
-    day = require_open_day(c)
+    day = require_open_day(c, staff_id)
     qty = float(qty)
     if not math.isfinite(qty) or abs(qty) > 1e9:
         raise RuleError("Quantity is not a valid number.")
@@ -660,7 +675,7 @@ def receive_po(c, staff_id, po_id, lines, note=None, client_ref=None):
     """Stock goes up ONLY here (or in a direct delivery), when goods physically arrive."""
     if client_ref and c.execute("SELECT 1 FROM stock_movements WHERE client_ref LIKE ?", (client_ref + "#%",)).fetchone():
         return po_view(c, po_id), True
-    day = require_open_day(c)
+    day = require_open_day(c, staff_id)
     po = c.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
     if not po:
         raise RuleError("Purchase order not found.")
@@ -741,7 +756,9 @@ def tolerance_for(line, pct):
 
 def close_day(c, staff_id, counts, notes=None):
     """counts: {ingredient_id: {"counted": number|None, "reason": str, "note": str}}"""
-    day = require_open_day(c)
+    day = open_day_row(c)
+    if not day:
+        raise RuleError("No business day is open, so there is nothing to close.")
     open_shifts = c.execute("""SELECT st.name FROM shifts sh JOIN staff st ON st.id = sh.staff_id
                                WHERE sh.day_id = ? AND sh.status = 'open'""", (day["id"],)).fetchall()
     if open_shifts:

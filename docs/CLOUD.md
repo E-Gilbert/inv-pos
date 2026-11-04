@@ -152,6 +152,12 @@ Status codes worth handling: `401` not signed in / session expired → send to t
 `403` signed in but not linked to staff, or not allowed; `404` with "inventory-only" → a till
 feature that is switched off here.
 
+## 6. Bringing in this month's records and daily routine
+
+* **Import records**: cityfoodcourt.co.ke/admin/inventory → *Import records* (or *Open / Close day* in the INV-POS screen, which offers it while there are no closed days). Excel or CSV, one sheet per day or one table with a date column. Units are taken from the file, matching stock items or the quantities; only items that can't be told apart are asked about. Today then opens with the last closing count.
+* **Automatic opening**: set `INVPOS_AUTO_OPEN_DAY=1` on Render (already in `render.yaml`) or switch it on under Setup → Settings → *Opening the day*. The first stock entry of a new day opens it with last night's closing carried over. Closing still needs the night count (website: *Inventory → Day*).
+* **Analytics**: `GET /api/analytics?days=7|30|90` feeds both dashboards. Values in KES are only returned to roles that may see costs.
+
 ## Backups
 
 Supabase's free plan has no downloadable backups. Take your own, at least weekly and before
