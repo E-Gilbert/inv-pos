@@ -285,7 +285,10 @@ def init_db(url, default_settings):
     conn = connect(url)
     try:
         sch = pg_schema()
-        conn._conn.execute(f"CREATE SCHEMA IF NOT EXISTS {sch}")  # nosec B608
+        # Only create the schema when missing: a restricted role (Supabase setup in docs/CLOUD.md)
+        # owns an existing schema but has no CREATE right on the database itself.
+        if not conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = ?", (sch,)).fetchone():
+            conn._conn.execute(f"CREATE SCHEMA {sch}")  # nosec B608
         conn.execute("BEGIN IMMEDIATE")
         fresh = not conn.execute(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = 'schema_meta'",

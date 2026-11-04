@@ -31,22 +31,43 @@ adjustments and the daily count, and sales can be brought in with the stock work
 
 ## 1. Supabase (database + logins)
 
-The website is already linked to a Supabase project. INV-POS uses the **same project** but its
-own schema, `inventory`, created automatically on first start.
+INV-POS uses the **same Supabase project as the website**: the website's logins are issued
+by that project, so INV-POS must trust it anyway. The data goes in its own schema,
+`inventory`, owned by its own database user, `invpos`. That user can't see the website's
+tables, and the website's public key can't see INV-POS's.
 
-* **Why a separate schema:** Supabase's Data API only exposes the schemas listed under
-  *Project Settings → Data API → Exposed schemas* (by default `public`). Leaving `inventory`
-  off that list means the website's public (anon) key can never read stock, costs or staff.
-  **Do not add `inventory` to the exposed schemas.**
-* **Connection string:** Supabase → **Connect** → *Session pooler* → copy the URI
-  (`postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`).
-  Use the session pooler (port 5432), not the transaction pooler (6543): INV-POS sets the time
+**Run once, in Supabase → SQL Editor** (pick a long random password and keep it):
+
+```sql
+do $$ begin
+  if not exists (select from pg_roles where rolname = 'invpos') then
+    create role invpos with login password 'CHANGE-ME-long-random-password';
+  end if;
+end $$;
+grant invpos to current_user;   -- lets Supabase's "postgres" user hand the schema to invpos
+create schema if not exists inventory authorization invpos;
+create extension if not exists citext with schema extensions;
+grant usage on schema extensions to invpos;
+revoke all on schema inventory from anon, authenticated;
+```
+
+Safe to run more than once. (Without the `grant` line Supabase answers
+`must be able to SET ROLE "invpos"`: its `postgres` user isn't a superuser.)
+To change the password later: `alter role invpos with password '...';`
+
+* **Don't expose it.** Leave `inventory` *off* the list under *Project Settings → Data API →
+  Exposed schemas*. Then the website's anon/authenticated keys can never reach stock, costs or staff.
+* **Connection string:** Supabase → **Connect** → *Session pooler*. Copy the URI and swap in
+  the new user: `postgresql://invpos.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`.
+  Use the session pooler (port 5432), not the transaction pooler (6543). INV-POS sets the time
   zone and schema once per connection. The direct connection is IPv6-only on the free plan,
-  which Render can't reach.
+  which Render can't reach. Note the pooler host's region (e.g. `eu-central-1`): Render should run in the same area.
 * **Free plan pausing:** a free project pauses after about a week with no activity. Daily use keeps it awake.
 * **Logins:** in *Authentication → Sign In / Providers* keep **Confirm email** on. If the
   website dashboard is for staff only, turn off *Allow new users to sign up* and invite staff
   instead. INV-POS only trusts the e-mail in a confirmed, signed-in Supabase session.
+* **Signing keys:** *Project Settings → JWT Keys*. If it shows the new signing keys, nothing
+  more is needed. If it still says *Legacy JWT secret*, copy that secret for `SUPABASE_JWT_SECRET`.
 
 ## 2. Render (the API)
 
@@ -65,7 +86,7 @@ own schema, `inventory`, created automatically on first start.
    Only set `SUPABASE_JWT_SECRET` if the Supabase project still signs with the legacy shared secret
    (*Project Settings → JWT Keys* says "Legacy JWT secret"); projects on the new signing keys need nothing.
 4. Pick the Render region **closest to the Supabase project's region** (each query crosses that link).
-   `render.yaml` says `frankfurt`; change it if Supabase is elsewhere.
+   CFC's Supabase is in `us-east-1`, so `render.yaml` uses `virginia`.
 5. Deploy. Open `https://<service>.onrender.com/api/health`: you should see `"pos": false`.
 
 **Free plan behaviour:** the service sleeps after about 15 minutes with no requests; the first
@@ -88,6 +109,7 @@ The website itself is not touched by this.
 1. Open `https://api.cityfoodcourt.co.ke` and log in with PIN **1234**. You must choose a new admin PIN.
 2. Load CFC's menu: run once from your PC with the cloud settings, e.g. (PowerShell)
    ```
+   pip install -r requirements-cloud.txt
    $env:DATABASE_URL="<session pooler URI>"; $env:INVPOS_SECRET="<same secret>"; $env:TZ="Africa/Nairobi"
    python scripts\load_menu.py menus\cfc_menu.csv --hide-missing --cfc
    ```
