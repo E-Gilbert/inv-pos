@@ -83,6 +83,24 @@ function toast(msg, bad = false) {
 }
 const fail = (e) => toast(e.message || String(e), true);
 
+function openWhatsAppDraft(message) {
+  let phone = String(S.state?.settings?.notification_phone || "").replace(/\D/g, "");
+  if (phone.length === 10 && phone.startsWith("0")) phone = "254" + phone.slice(1);
+  else if (phone.length === 9) phone = "254" + phone;
+  if (phone.length < 8 || phone.length > 15) {
+    toast("Set a valid WhatsApp number in Setup → Settings first.", true);
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  toast("WhatsApp draft opened. Review it and press Send.");
+}
+
 function modal(html, cls = "") {
   closeModal();
   const bg = document.createElement("div");
@@ -1171,13 +1189,14 @@ async function viewPurchasing(el) {
     document.getElementById("pu").innerHTML = `
       <div class="panel"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Purchase orders</h2>
         <div class="shrink"><button class="btn primary" id="np" ${sups.some((s) => s.active) ? "" : "disabled title='Add a supplier first'"}>+ New purchase order</button></div></div>
-        <div class="small muted" style="margin-bottom:8px">Ordered stock shows as <span class="st blue">Incoming</span> and is <b>not</b> counted as stock until it is received.</div>
+        <div class="small muted" style="margin-bottom:8px">Ordered stock shows as <span class="st blue">Incoming</span> and is <b>not</b> counted as stock until it is received. Use WhatsApp to prepare a purchase message for the configured number; staff must review and send it.</div>
         ${pos.length ? `<div class="tablewrap"><table><thead><tr><th>#</th><th>Supplier</th><th>Status</th><th>Items</th><th class="num">Value ordered</th><th class="num">Received</th><th>Expected</th><th></th></tr></thead><tbody>
           ${pos.map((p) => `<tr><td>${p.id}</td><td>${esc(p.supplier)}</td><td><span class="st ${ST[p.status]}">${p.status}</span></td>
             <td class="small">${p.lines.map((l) => `${esc(l.name)} ${fmtQty(l.qty_received, l.unit)}/${fmtQty(l.qty_ordered, l.unit)}`).join(", ")}</td>
             <td class="num">${money(p.value_ordered)}</td><td class="num">${money(p.value_received)}</td><td>${esc(p.expected_date || "")}</td>
             <td style="white-space:nowrap">${p.status === "draft" ? `<button class="btn" data-ed="${p.id}">Edit</button> <button class="btn primary" data-or="${p.id}">Mark ordered</button>` : ""}
               ${["ordered", "partial"].includes(p.status) && can("stock.receive") ? `<button class="btn primary" data-rc="${p.id}">Receive</button>` : ""}
+              ${p.status !== "cancelled" ? ` <button class="btn" data-wa="${p.id}">WhatsApp</button>` : ""}
               ${!["received", "cancelled"].includes(p.status) ? `<button class="btn danger" data-cx="${p.id}">${p.status === "partial" ? "Close short" : "Cancel"}</button>` : ""}</td></tr>`).join("")}
         </tbody></table></div>` : `<div class="empty">No purchase orders yet.</div>`}
       </div>
@@ -1188,6 +1207,16 @@ async function viewPurchasing(el) {
     const reload = () => viewPurchasing(el);
     const act = async (id, a) => { try { await api(`/api/purchase-orders/${id}/${a}`, { method: "POST" }); reload(); } catch (e) { fail(e); } };
     el.querySelectorAll("[data-or]").forEach((b) => b.addEventListener("click", () => act(b.dataset.or, "order")));
+    el.querySelectorAll("[data-wa]").forEach((b) => b.addEventListener("click", () => {
+      const p = pos.find((x) => x.id === Number(b.dataset.wa));
+      if (!p) return;
+      const lines = [`${S.state.business_name} · Stock purchase #${p.id}`, `Status: ${p.status}`, `Supplier: ${p.supplier}`];
+      if (p.expected_date) lines.push(`Expected: ${p.expected_date}`);
+      p.lines.forEach((l) => lines.push(`• ${l.name}: ${fmtQty(l.qty_ordered, l.unit)} ordered, ${fmtQty(l.qty_received, l.unit)} received`));
+      lines.push(`Value ordered: ${money(p.value_ordered)}`, `Value received: ${money(p.value_received)}`);
+      if (p.notes) lines.push(`Notes: ${p.notes}`);
+      openWhatsAppDraft(lines.join("\n"));
+    }));
     el.querySelectorAll("[data-cx]").forEach((b) => b.addEventListener("click", () => { if (confirm("Close this purchase order? Anything not yet received will no longer be expected.")) act(b.dataset.cx, "cancel"); }));
     el.querySelectorAll("[data-rc]").forEach((b) => b.addEventListener("click", () => receiveModal(pos.find((p) => p.id === Number(b.dataset.rc)), reload)));
     el.querySelectorAll("[data-ed]").forEach((b) => b.addEventListener("click", () => poModal(sups, ov, pos.find((p) => p.id === Number(b.dataset.ed)), reload)));
@@ -1452,20 +1481,41 @@ async function viewReport(rv, id, el) {
   const r = await api("/api/reports/day/" + id).catch(fail);
   if (!r) return;
   rv.innerHTML = `<div class="row" style="margin-bottom:12px"><div class="shrink"><button class="btn" id="back">← All days</button></div>
-    <div class="shrink"><button class="btn" id="pr">Print report</button></div></div>
+    <div class="shrink"><button class="btn" id="pr">Print report</button></div>
+    <div class="shrink"><button class="btn" id="dw">WhatsApp summary</button></div></div>
     <div class="panel">${reportHTML(r)}</div>`;
   document.getElementById("back").onclick = () => { S.reportDay = null; viewReports(el); };
   document.getElementById("pr").onclick = () => printHTML(reportHTML(r));
+  document.getElementById("dw").onclick = () => {
+    const s = r.summary;
+    const issues = r.stock.filter((x) => x.variance != null && Math.abs(x.variance) > 1e-9).slice(0, 8);
+    const lines = [`${S.state.business_name} · Day report ${r.day.business_date}${r.day.covers_to ? ` to ${r.day.covers_to}` : ""}`,
+      `Collected: ${money(s.collected)} · Refunds: ${money(s.refunds)}`,
+      `Net sales ex tax: ${money(s.net_sales_ex_tax)} · COGS: ${money(s.cogs)} · Gross profit: ${money(s.gross_profit)}`,
+      `Orders: ${s.orders} · Voids: ${s.voids}`, `Recorded waste: ${money(r.waste_value)}`];
+    if (issues.length) lines.push("Stock differences:", ...issues.map((x) => `${x.name}: ${fmtQty(x.variance, x.unit, true)}`));
+    if (r.stock.filter((x) => x.variance != null && Math.abs(x.variance) > 1e-9).length > issues.length) lines.push("Additional stock differences are in the full report.");
+    openWhatsAppDraft(lines.join("\n"));
+  };
 }
 
 async function reportPeriod(rv) {
   rv.innerHTML = `<div class="panel"><div class="row" style="max-width:640px"><div><label>From</label><input id="pf" type="date" value="${daysAgo(6)}"></div>
     <div><label>To</label><input id="pt" type="date" value="${today()}"></div><div class="shrink"><button class="btn primary" id="pg">Show</button></div>
+    <div class="shrink"><button class="btn" id="ps">WhatsApp summary</button></div>
     <div class="shrink"><button class="btn" id="px">Items CSV</button></div></div><div id="po" style="margin-top:14px"></div></div>`;
   const go = async () => {
     const f = document.getElementById("pf").value, t = document.getElementById("pt").value;
     try {
       const r = await api(`/api/reports/period?date_from=${f}&date_to=${t}`);
+      document.getElementById("ps").onclick = () => openWhatsAppDraft([
+        `${S.state.business_name} · Period report`,
+        `Period: ${f} to ${t} · ${r.days} business day(s)`,
+        `Gross sales: ${money(r.gross_sales)} · Discounts: ${money(r.discounts)} · Refunds: ${money(r.refunds)}`,
+        `Net sales ex tax: ${money(r.net_sales_ex_tax)} · COGS: ${money(r.cogs)}`,
+        `Gross profit: ${money(r.gross_profit)}${r.gross_margin_pct != null ? ` (${r.gross_margin_pct}% margin)` : ""}`,
+        `Purchases received: ${money(r.purchases_total)} · Waste: ${money(r.waste_value)} · Stock shortages: ${money(r.shortage_value)}`,
+      ].join("\n"));
       document.getElementById("po").innerHTML = `
         <div class="kpis">
           <div class="kpi"><div class="l">Days</div><div class="v">${r.days}</div></div>
@@ -1503,6 +1553,7 @@ async function reportValuation(rv) {
   const r = await api("/api/reports/valuation").catch(fail);
   if (!r) return;
   rv.innerHTML = `<div class="panel"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Stock valuation · ${money(r.total)}</h2>
+      <div class="shrink"><button class="btn" id="vw">WhatsApp summary</button></div>
       <div class="shrink"><button class="btn" id="vx">Export CSV</button></div></div>
     <div class="small muted">On-hand quantity × current cost per unit. Incoming (ordered) stock is not included. Negative stock is valued at 0.</div>
     ${r.uncosted.length ? `<div class="note">No cost set: ${r.uncosted.map(esc).join(", ")}</div>` : ""}
@@ -1511,6 +1562,12 @@ async function reportValuation(rv) {
     ${r.lines.map((o) => `<tr class="st-row-${STATUS_COLOUR[o.status]}"><td>${esc(o.name)}</td><td>${stBadge(o.status)} ${incomingBadge(o.incoming, o.unit)}</td><td class="num">${fmtQty(o.on_hand, o.unit)}</td>
       <td class="num">${money((o.cost_per_unit || 0) * big[o.unit][1])} / ${bigUnit(o.unit)}</td><td class="num">${money(o.value)}</td></tr>`).join("")}</tbody></table></div></div>`;
   document.getElementById("vx").onclick = () => download("/api/export/stock.csv", "stock.csv");
+  document.getElementById("vw").onclick = () => openWhatsAppDraft([
+    `${S.state.business_name} · Stock valuation`,
+    `Current stock value: ${money(r.total)}`,
+    r.uncosted.length ? `Items without costs: ${r.uncosted.slice(0, 8).join(", ")}` : "All active stock items have costs.",
+    r.negative.length ? `Negative stock: ${r.negative.slice(0, 8).join(", ")}` : "No negative stock balances.",
+  ].join("\n"));
 }
 
 
@@ -1552,6 +1609,7 @@ async function reportHub(rv) {
     <div class="rgroups">${Object.entries(groups).map(([g, list]) => `<fieldset class="rgroup"><legend>${esc(g)}</legend>
       ${list.map((r) => `<button class="btn ${S.rptKey === r.key ? "primary" : ""}" data-rk="${r.key}">${esc(r.title)}</button>`).join("")}</fieldset>`).join("")}</div>
     <div class="row" style="margin-top:6px"><div class="shrink"><button class="btn" id="hp">Print</button></div>
+      <div class="shrink"><button class="btn" id="hw">WhatsApp summary</button></div>
       ${can("data.export") ? `<div class="shrink"><button class="btn" id="hx">Export CSV</button></div>` : ""}
       <div class="shrink"><button class="btn" id="heod" title="Sales, tax, cashier, employee, category, menu item, discounts, voids, refunds">Print end-of-day pack</button></div></div>
   </div><div class="panel" id="hout"><div class="empty">Loading…</div></div>`;
@@ -1574,6 +1632,20 @@ async function reportHub(rv) {
     S.rptKey = b.dataset.rk; rv.querySelectorAll("[data-rk]").forEach((x) => x.classList.toggle("primary", x === b)); show();
   }));
   document.getElementById("hp").onclick = () => current && printHTML(`<div class="printrep">${reportBodyHTML(current)}</div>`);
+  document.getElementById("hw").onclick = () => {
+    if (!current) return;
+    const lines = [`${current.business_name} · ${current.title}`, `Period: ${current.from}${current.from === current.to ? "" : ` to ${current.to}`} · ${current.days} business day(s)`];
+    for (const section of current.sections) {
+      if (section.totals) {
+        const values = section.columns.filter((c) => c.type !== "text" && section.totals[c.key] != null)
+          .slice(0, 4).map((c) => `${c.label}: ${section.totals[c.key]}`);
+        if (values.length) lines.push(`${section.title}: ${values.join(", ")}`);
+      } else if (section.rows.length) {
+        lines.push(`${section.title}: ${section.rows.length} record(s)`);
+      }
+    }
+    openWhatsAppDraft(lines.join("\n"));
+  };
   document.getElementById("hx")?.addEventListener("click", () => download(`/api/reports/run/${S.rptKey}?${qs()}&format=csv`, `${S.rptKey}-${S.rptFrom}_${S.rptTo}.csv`));
   document.getElementById("heod").onclick = async () => {
     try {
@@ -1758,7 +1830,9 @@ async function setupExcel(sv) {
     <div class="note">Check first: nothing is saved until you press <b>Import</b>, and if any row has a problem nothing is saved. Importing replaces the recipe of every dish in the file; an item's unit can't change once it has stock history.</div>
     <div class="row"><div><input type="file" id="f" accept=".xlsx,.csv"></div><div class="shrink"><button class="btn" id="pv">Check file</button></div><div class="shrink"><button class="btn primary" id="up" disabled>Import</button></div></div>
     <div class="err" id="xerr"></div><div id="xok"></div></div>
-    <div class="panel"><h2>Import past stock records</h2><div id="recimp"></div></div>`;
+    <div class="panel"><h2>Import past stock records</h2>
+      <div class="info">A workbook can contain only the items recorded that day; it does not replace or deactivate the full stock-item list. Items omitted from a partial history file carry forward their latest known closing count.</div>
+      <div id="recimp"></div></div>`;
   document.getElementById("dl").onclick = () => download("/api/excel", "cfc-recipes.xlsx");
   document.getElementById("mdl")?.addEventListener("click", () => download("/api/export/menu.csv", "menu.csv"));
   const sendMenu = async (preview) => {
@@ -1812,7 +1886,7 @@ function recordsImporter(box, { openDay }) {
   const units = ["", "kg", "g", "L", "ml", "pcs"];
   box.innerHTML = `<p class="small muted" style="margin-top:0">Excel or CSV. Either one sheet per day with opening, additions and closing columns,
       or one table with a date column (date, item, opening, received, closing, sales, waste, unit, unit cost, note; most column names are recognised).
-      A blank opening is taken from the item's previous closing. The file itself is never changed.</p>
+      Include only the items with recorded movements or counts; omitted items are not deleted from stock and keep their latest known closing count. A blank opening is taken from the item's previous closing. The file itself is never changed.</p>
     <div class="dropzone"><div class="row"><div><input type="file" id="ri-f" accept=".xlsx,.csv" aria-label="Records file"></div>
       <div class="shrink"><label>Month (only if dates have no month)</label><input id="ri-m" type="month" style="width:170px"></div>
       <div class="shrink"><button class="btn" id="ri-a">Read file</button></div></div></div>
@@ -1908,7 +1982,9 @@ async function setupSettings(sv) {
   sv.innerHTML = `<div class="panel" style="max-width:760px"><h2>Settings</h2>
     <h3>Business & receipts</h3>
     <div class="row"><div><label>Business name</label><input id="bn" value="${esc(s.business_name)}" maxlength="80"></div><div><label>Address / town</label><input id="ba" value="${esc(s.business_address)}" maxlength="120"></div></div>
-    <div class="row"><div><label>Phone on receipts</label><input id="bph" value="${esc(s.business_phone || "")}" maxlength="30"></div></div>
+    <div class="row"><div><label>Phone on receipts</label><input id="bph" value="${esc(s.business_phone || "")}" maxlength="30"></div>
+      <div><label>WhatsApp reports &amp; purchases</label><input id="nph" value="${esc(s.notification_phone || "")}" maxlength="30" placeholder="0759795356"></div></div>
+    <div class="small muted">WhatsApp opens a message draft addressed here; a staff member must review it and tap Send.</div>
     <div class="row"><div><label>KRA PIN on receipts (optional)</label><input id="bp" value="${esc(s.business_pin)}" maxlength="20"></div><div><label>Receipt footer</label><input id="rf" value="${esc(s.receipt_footer)}" maxlength="200"></div></div>
     <h3 style="margin-top:16px">Tax</h3>
     <div class="note">Set this only after confirming the business's VAT position with its accountant. These receipts are not KRA eTIMS fiscal receipts.</div>
@@ -1936,6 +2012,7 @@ async function setupSettings(sv) {
     try {
       await api("/api/settings", { method: "PUT", json: {
         business_name: v("bn"), business_address: v("ba"), business_pin: v("bp"), receipt_footer: v("rf"), business_phone: v("bph"),
+        notification_phone: v("nph"),
         variance_tolerance_pct: Number(v("tp")), tax_rate_pct: Number(v("tr") || 0), tax_inclusive: v("ti") === "1", tax_label: v("tl") || "VAT",
         cashier_max_discount_pct: Number(v("md") || 0), critical_pct_of_reorder: Number(v("cp") || 0), reorder_cover_days: Number(v("rc") || 0),
         cost_method: v("cm"), require_shift: v("rs") === "1", session_idle_minutes: Number(v("si") || 720),

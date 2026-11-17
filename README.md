@@ -102,10 +102,12 @@ pip-audit -r requirements-cloud.txt
 
 ## Loading CFC's data
 
-1. **Stock history** — Setup → Import / export → *Import stock history*: choose `oct 2026 stock movement.xlsx`, *Analyse*, confirm the unit of every item (the system suggests but never guesses), review the discrepancy list, import. Each sheet becomes a closed read-only day; the last closing becomes the next opening. The workbook file is never modified. Findings for the October workbook: [docs/WORKBOOK_RECONCILIATION.md](docs/WORKBOOK_RECONCILIATION.md).
+1. **Stock history** — Setup → Import / export → *Import stock history*: choose `oct 2026 stock movement.xlsx`, *Analyse*, confirm the unit of every item (the system suggests but never guesses), review the discrepancy list, import. Each sheet becomes a closed read-only day. A sheet may list only the items with records for that day; it never replaces the full stock-item list, and omitted items carry forward their latest known closing count. The workbook file is never modified. Findings for the October workbook: [docs/WORKBOOK_RECONCILIATION.md](docs/WORKBOOK_RECONCILIATION.md).
 2. **Costs & thresholds** — Setup → Items & thresholds: set purchase cost, reorder level (and optionally critical level) for each item. Until costs are set, valuation and gross profit show warnings.
 3. **Menu** — `scripts\windows\load_cfc_menu.bat` (or Setup → Import / export → Menu CSV with `menus/cfc_menu.csv`). Review the items marked *Needs review* in Setup → Menu.
 4. **Recipes** — Setup → Import / export → *Download Excel*, fill *Recipes* (one row per ingredient per dish, raw quantity per plate), *Check file*, then *Import*.
+
+Reports and purchase orders can be prepared as WhatsApp messages to the number in **Setup → Settings** (default `0759795356`). This opens a prefilled WhatsApp draft; a staff member must review and tap **Send**. Detailed reports remain available to print or export as CSV.
 
 ## Backups
 

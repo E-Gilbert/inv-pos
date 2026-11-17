@@ -10,7 +10,7 @@ from app import workbook
 from conftest import login, open_day
 
 
-def make_workbook(break_carry=False, dup=False):
+def make_workbook(break_carry=False, dup=False, omit_last_sodas=False):
     wb = Workbook()
     wb.remove(wb.active)
     data = {  # sheet: [(item, opening, additions, closing, system, note)]
@@ -21,6 +21,8 @@ def make_workbook(break_carry=False, dup=False):
         "4th-5th": [("raw goat meat", 5.06, 18.6, 10.32, 12.63, None), ("chapati", 0, 43, 12, 32, None),
                     ("sodas", 314, None, 267, 47, None), ("samosa", 60, 18, 48, 30, None)],
     }
+    if omit_last_sodas:
+        data["4th-5th"] = [row for row in data["4th-5th"] if row[0] != "sodas"]
     for name, rows in data.items():
         ws = wb.create_sheet(name)
         for col, h in zip("CDEFGH", ["opening", "additions", "closing", "actual sales", "system sales", "variance"], strict=True):
@@ -104,3 +106,17 @@ def test_unit_must_match_existing_item(cl):
     r = cl.post("/api/import/stock-workbook?commit=true", headers=M, files=f, data={"mapping": mapping})
     assert r.status_code == 400 and "measured in ml" in r.json()["detail"]
     assert cl.get("/api/days", headers=M).json() == []  # nothing saved
+
+
+def test_partial_history_carries_forward_items_missing_from_latest_sheet(cl):
+    M = login(cl, "2222")
+    f = {"file": ("oct 2026 stock movement.xlsx", make_workbook(omit_last_sodas=True))}
+    mapping = '{"raw goat meat": {"unit": "kg"}, "chapati": {"unit": "pcs"}, "sodas": {"unit": "pcs"}, "samosa": {"unit": "pcs"}}'
+    r = cl.post("/api/import/stock-workbook?commit=true", headers=M, files=f, data={"mapping": mapping})
+    assert r.status_code == 200, r.text
+
+    preview = cl.get("/api/day/opening-preview", headers=M).json()
+    soda = next(row for row in preview["rows"] if row["name"] == "sodas")
+    assert soda["carry_over"] == 314  # from its latest recorded count, not zero for being absent
+    items = cl.get("/api/ingredients", headers=M).json()
+    assert any(item["name"] == "Water 500ml" and item["active"] for item in items)

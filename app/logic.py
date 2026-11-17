@@ -113,12 +113,17 @@ def last_closed_day(c):
 
 
 def last_closing(c):
-    """{ingredient_id: counted closing} from the most recent closed day."""
-    prev = last_closed_day(c)
-    if not prev:
-        return {}
-    rows = c.execute("SELECT ingredient_id, counted FROM day_stock WHERE day_id = ?", (prev["id"],))
-    return {r["ingredient_id"]: r["counted"] for r in rows}
+    """{ingredient_id: latest known counted closing}, carrying partial counts forward."""
+    rows = c.execute(
+        """SELECT ds.ingredient_id, ds.counted
+           FROM day_stock ds JOIN days d ON d.id = ds.day_id
+           WHERE d.status = 'closed' AND ds.counted IS NOT NULL
+           ORDER BY COALESCE(d.covers_to, d.business_date) DESC, d.business_date DESC, d.id DESC"""
+    )
+    carry = {}
+    for row in rows:
+        carry.setdefault(row["ingredient_id"], row["counted"])
+    return carry
 
 
 def open_day(c, staff_id, business_date=None, opening_counts=None):

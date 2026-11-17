@@ -16,7 +16,7 @@ The workbook was only read, never modified. Re-run any time: Setup → Import / 
 | H variance | `= G − F` | `day_stock.variance = counted − expected` (**identical value and sign**) |
 | I note | free text | `day_stock.reason` ("Workbook note: …") |
 
-Imported sheets become closed, read-only days (`source = workbook`). The last closing (12th) becomes the opening stock offered when the next day is opened. The 9th–12th history also feeds the reorder suggestions.
+Imported sheets become closed, read-only days (`source = workbook`). Sheets may include only items with records for that day; omitted items are not removed from the inventory catalogue. When a later sheet omits an item, its last known counted closing carries forward when opening the next day. The last closing (12th) becomes the opening stock offered when the next day is opened. The 9th–12th history also feeds the reorder suggestions.
 
 ## Integrity checks: all passed
 * All `actual sales` and `variance` formulas are correct (recomputed for every row: 0 mismatches).

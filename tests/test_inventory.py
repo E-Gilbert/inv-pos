@@ -14,6 +14,16 @@ def test_classify_rules():
     assert classify(0, 10, 0, 0, 50) == "inactive"
 
 
+def test_whatsapp_destination_defaults_and_can_be_changed_by_admin(cl):
+    A = login(cl, "1234")
+    assert cl.get("/api/state", headers=A).json()["settings"]["notification_phone"] == "0759795356"
+    r = cl.put("/api/settings", headers=A, json={
+        "business_name": "CFC", "variance_tolerance_pct": 2, "notification_phone": "+254 759 795 356",
+    })
+    assert r.status_code == 200, r.text
+    assert cl.get("/api/state", headers=A).json()["settings"]["notification_phone"] == "+254 759 795 356"
+
+
 def _supplier(cl, h):
     return cl.get("/api/suppliers", headers=h).json()[0]["id"]
 

@@ -1220,6 +1220,7 @@ class Settings(BaseModel):
     require_shift: bool = True
     session_idle_minutes: int = Field(default=720, ge=5, le=1440)
     business_phone: str = Field(default="", max_length=30)
+    notification_phone: str = Field(default="0759795356", max_length=30)
     order_types: str = Field(default="Dine in,Takeaway,Delivery", min_length=1, max_length=200)
     ask_guests: bool = False
     serving_periods: str = Field(default=DEFAULT_SETTINGS["serving_periods"], max_length=300)
