@@ -829,7 +829,7 @@ class CloseDay(BaseModel):
 def close_day(body: CloseDay, staff=Depends(need("day.manage"))):
     with tx() as c:
         day_id = logic.close_day(c, staff["id"], body.counts, body.notes)
-        return logic.day_report(c, day_id)
+        return logic.close_day_report(c, day_id)
 
 
 @app.get("/api/days")

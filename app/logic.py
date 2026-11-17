@@ -1033,6 +1033,35 @@ def day_report(c, day_id):
     }
 
 
+def close_day_report(c, day_id):
+    """Return the day report plus a formal end-of-day pack summary for managers."""
+    from . import reports
+
+    report = day_report(c, day_id)
+    day = c.execute("SELECT business_date FROM days WHERE id = ?", (day_id,)).fetchone()
+    if not day:
+        raise RuleError("Day not found.")
+    pack = [reports.run(c, key, day["business_date"], day["business_date"]) for key in reports.EOD_PACK]
+    report["management_summary"] = {
+        "business_date": day["business_date"],
+        "orders": report["summary"]["orders"],
+        "voids": report["summary"]["voids"],
+        "gross_sales": report["summary"]["gross_sales"],
+        "discounts": report["summary"]["discounts"],
+        "tax": report["summary"]["tax"],
+        "refunds": report["summary"]["refunds"],
+        "net_sales_ex_tax": report["summary"]["net_sales_ex_tax"],
+        "cogs": report["summary"]["cogs"],
+        "gross_profit": report["summary"]["gross_profit"],
+        "shortage_value": report["shortage_value"],
+        "waste_value": report["waste_value"],
+        "stock_variance_count": sum(1 for l in report["stock"] if l.get("variance") is not None and abs(l["variance"]) > (l.get("tolerance") or 0) + 1e-9),
+    }
+    report["report_pack"] = pack
+    report["eod_pack"] = [{"key": r["key"], "title": r["title"], "days": r["days"]} for r in pack]
+    return report
+
+
 def recent_dates(days_back=30):
     t = date.today()
     return (t - timedelta(days=days_back)).isoformat(), t.isoformat()
